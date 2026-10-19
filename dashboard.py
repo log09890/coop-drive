@@ -92,16 +92,17 @@ HELP = [
     ('v2x <key> <value>', 'latency <ms> · loss <%> · range <m> · gps <m> · cars|bikes <%> · on · off'),
     ('pause | reset', 'freeze / resume · new episode'),
     ('replay | gif [file]', 'play back / save the last ~10 s'),
+    ('fullscreen [on|off]', 'toggle fullscreen (or F11), aspect kept'),
     ('snapshot [file]', 'save the window as PNG'),
     ('stats | history | log', 'session metrics · typed commands · log file path'),
     ('cls | quit', 'clear the terminal · exit'),
     ('keys', 'Enter run · ↑↓ history · Tab complete · PgUp/PgDn or wheel scroll · Esc clear'),
 ]
 COMPLETE = {'spawn': sorted(SCENARIOS) + sorted(EVENTS), 'weather': sorted(WEATHER), 'driver': ['expert', 'ppo'],
-            'focus': sorted(META) + ['off'], 'chaos': ['on', 'off'], 'page': list(PAGES),
+            'focus': sorted(META) + ['off'], 'chaos': ['on', 'off'], 'fullscreen': ['on', 'off'], 'page': list(PAGES),
             'v2x': ['latency', 'loss', 'range', 'gps', 'cars', 'bikes', 'on', 'off']}
 COMMANDS = ['help', 'page', 'focus', 'spawn', 'chaos', 'density', 'driver', 'weather', 'v2x', 'pause', 'reset', 'replay',
-            'gif', 'snapshot', 'stats', 'history', 'log', 'cls', 'clear', 'quit']
+            'gif', 'fullscreen', 'snapshot', 'stats', 'history', 'log', 'cls', 'clear', 'quit']
 
 
 class ChaseCamera:
@@ -263,7 +264,8 @@ class Dashboard:
         pygame.key.set_repeat(400, 30)
         info = pygame.display.Info()
         k = min(1.0, info.current_w * 0.96 / W, (info.current_h - 100) * 0.96 / H)
-        self.window = pygame.display.set_mode((int(W * k), int(H * k)), pygame.RESIZABLE)
+        self.windowed, self.fullscreen = (int(W * k), int(H * k)), False
+        self.window = pygame.display.set_mode(self.windowed, pygame.RESIZABLE)
         self.screen = pygame.Surface((W, H))  # everything is drawn here at a fixed size
         self.run_id = time.strftime('%Y%m%d-%H%M%S')
         pygame.display.set_caption(f'Coop-Drive research console · run {self.run_id}')
@@ -385,6 +387,23 @@ class Dashboard:
             self.sens, self.sens_step = input_sensitivity(self.agent.old_policy.actor, o), env.timesteps
         return self.sens
 
+    def set_fullscreen(self, on):
+        self.fullscreen = on
+        self.window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN) if on else pygame.display.set_mode(self.windowed, pygame.RESIZABLE)
+        self.log(f"fullscreen {'on' if on else 'off'} · {self.window.get_width()}×{self.window.get_height()} · F11 toggles", 'OUT')
+
+    def present(self, surf):
+        '''Show the fixed-size canvas in the window, scaled with the aspect kept (letterboxed in fullscreen).'''
+        ww, wh = self.window.get_size()
+        if (ww, wh) == surf.get_size():
+            self.window.blit(surf, (0, 0))
+        else:
+            k = min(ww / surf.get_width(), wh / surf.get_height())
+            size = (int(surf.get_width() * k), int(surf.get_height() * k))
+            self.window.fill(BG)
+            self.window.blit(pygame.transform.smoothscale(surf, size), ((ww - size[0]) // 2, (wh - size[1]) // 2))
+        pygame.display.flip()
+
     def start_replay(self):
         if len(self.frames) < 5:
             return self.log('nothing to replay yet', 'WARN')
@@ -487,6 +506,9 @@ class Dashboard:
             return out(f"v2x {'on' if env.infra.enabled else 'off'} · {ch.latency * 1000:.0f} ms · loss {ch.loss * 100:.0f}% · "
                        f"range {ch.range:.0f} m · gps {env.infra.gps_sigma:.1f} m · fitted cars {env.infra.cam_cars * 100:.0f}% "
                        f"bikes {env.infra.cam_bikes * 100:.0f}%")
+        if cmd == 'fullscreen':
+            a = args[0].lower() if args else ''
+            return self.set_fullscreen(not self.fullscreen if a not in ('on', 'off') else a == 'on')
         if cmd == 'replay':
             return self.start_replay()
         if cmd == 'gif':
@@ -530,12 +552,15 @@ class Dashboard:
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 self.quit = True
-            elif e.type == pygame.VIDEORESIZE:
+            elif e.type == pygame.VIDEORESIZE and not self.fullscreen:
+                self.windowed = e.size
                 self.window = pygame.display.set_mode(e.size, pygame.RESIZABLE)
             elif e.type == pygame.MOUSEWHEEL:
                 self.term.scroll += 3 * e.y
             elif e.type == pygame.KEYDOWN:
-                if pygame.K_F1 <= e.key <= pygame.K_F5:
+                if e.key == pygame.K_F11:
+                    self.set_fullscreen(not self.fullscreen)
+                elif pygame.K_F1 <= e.key <= pygame.K_F5:
                     self.page, self.focus = list(PAGES)[e.key - pygame.K_F1], None
                 elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     line, self.line = self.line, ''
@@ -1107,11 +1132,7 @@ class Dashboard:
             if status:
                 self.text(s, status, (rect[0] + rect[2] - 6, rect[1] + 3), GREEN if status in ('live', 'nominal') else DIM, self.small, right=True)
         self.frames.append(pygame.transform.smoothscale(s, (W // 2, H // 2)))
-        if self.window.get_size() == (W, H):
-            self.window.blit(s, (0, 0))
-        else:
-            pygame.transform.smoothscale(s, self.window.get_size(), self.window)
-        pygame.display.flip()
+        self.present(s)
         self.ms['draw'] = (time.time() - t0) * 1000
 
     def draw_replay(self):
@@ -1121,8 +1142,7 @@ class Dashboard:
         pygame.draw.rect(frame, RED, (0, 0, W, HEAD))
         frame.blit(self.bold.render(f'  REPLAY {self.replay_i // 2 + 1}/{len(self.replay)}  ·  half speed  ·  Esc to stop  ·  gif to save',
                                     True, FG), (10, 8))
-        pygame.transform.smoothscale(frame, self.window.get_size(), self.window)
-        pygame.display.flip()
+        self.present(frame)
         self.replay_i += 1
         if self.replay_i // 2 >= len(self.replay):
             self.replay = None
@@ -1153,6 +1173,7 @@ def main():
     p.add_argument('--expert', action='store_true', help='drive with the waypoint expert from bc.py')
     p.add_argument('--vn', action='store_true', help='chaotic Vietnamese-style urban traffic (use with --town Town02)')
     p.add_argument('--infra', action='store_true', help='roadside units + V2X (CAM / CPM / SPaT / DENM) feeding the ego')
+    p.add_argument('--fullscreen', action='store_true', help='start fullscreen (F11 toggles)')
     p.add_argument('--collect', type=int, default=0, help='record N expert steps for bc.py train, then exit')
     p.add_argument('--noise', type=float, default=0.2, help='collect: steer noise std (executed, not labelled)')
     p.add_argument('--no-scenarios', dest='scenarios', action='store_false', help='collect: no pedestrians / slow cars')
@@ -1185,6 +1206,8 @@ def main():
     config = f"{args.town} {'VN' if args.vn else 'TM'}{' +INFRA' if args.infra else ''} obs {100 + COOP_OBS}"
     dash = Dashboard(agent, policy_ok, mode, config)
     sys.stdout = Tee(sys.stdout, dash.log)
+    if args.fullscreen:
+        dash.set_fullscreen(True)
     if args.expert and mode == 'drive':
         dash.driver = 'expert'
     tr = dash.train

@@ -32,7 +32,7 @@ thành `COOP_SECTORS` khoảng cách vật cản gần nhất theo từng góc, 
 ### Dashboard
 
 `Dashboard.bat` (shortcut "Coop-Drive Dashboard") hoặc `venv\Scripts\python dashboard.py [--town Town02 --vn --infra] [--model x.pth] [--expert]`.
-Giao diện kiểu research console, 5 trang (F1–F5 hoặc `page <tên>`):
+Giao diện kiểu research console, 5 trang (F1–F5 hoặc `page <tên>`); F11, `fullscreen` hoặc cờ `--fullscreen` để bật toàn màn hình (giữ tỉ lệ):
 - **overview**: camera chase, LiDAR hợp tác kiểu CODD, BEV + vùng nguy hiểm, telemetry, biểu đồ tốc độ, đánh giá tình huống.
 - **cameras**: chase, hood, gương trái/phải, camera lùi, BEV, camera trên cột RSU gần nhất.
 - **sensors**: ảnh semantic (đầu vào), VAE tái tạo + latent z, radar 16 sector + vùng chi phối pedal, V2X/RSU/SPaT/DENM, bảng mọi cảm biến (tần số, số điểm, tuổi frame), LiDAR hợp nhất.
