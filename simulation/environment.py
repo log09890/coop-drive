@@ -192,8 +192,8 @@ class CarlaEnvironment():
                     car = self.world.try_spawn_actor(random.choice(self.blueprint_library.filter('vehicle.*')), sp)
                     if car is None:
                         continue
-                    car.set_autopilot(True)
-                    tm = self.client.get_trafficmanager(8000)
+                    car.set_autopilot(True, TM_PORT)
+                    tm = self.client.get_trafficmanager(TM_PORT)
                     tm.ignore_signs_percentage(car, 100)  # 0.9.10 TM can wait forever at Town07 stop signs and block the route
                     tm.ignore_lights_percentage(car, 100)
                     self.actor_list.append(car)
@@ -486,7 +486,7 @@ class CarlaEnvironment():
                 other_vehicle = self.world.try_spawn_actor(
                     bp_vehicle, spawn_point)
                 if other_vehicle is not None:
-                    other_vehicle.set_autopilot(True)
+                    other_vehicle.set_autopilot(True, TM_PORT)
                     self.actor_list.append(other_vehicle)
             print("NPC vehicles have been generated in autopilot mode.")
         except:

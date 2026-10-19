@@ -1,5 +1,5 @@
 '''
-Chaotic Vietnamese-style urban traffic for CARLA 0.9.10 (sync mode, Traffic Manager on port 8000):
+Chaotic Vietnamese-style urban traffic for CARLA 0.9.10 (sync mode, Traffic Manager on settings.TM_PORT):
 mostly motorbikes, tailgating, mixed speeds, some red-light running and sign ignoring, motorbikes weaving
 between lanes, and pedestrians crossing anywhere.
 '''
@@ -7,6 +7,7 @@ import math
 import random
 import numpy as np
 from simulation.connection import carla
+from simulation.settings import TM_PORT
 
 MOTORBIKES = ('vehicle.yamaha.yzf', 'vehicle.kawasaki.ninja', 'vehicle.harley-davidson.low_rider')
 BICYCLES = ('vehicle.bh.crossbike', 'vehicle.gazelle.omafiets', 'vehicle.diamondback.century')
@@ -21,7 +22,7 @@ class VNTraffic:
     def __init__(self, client, world, n_motorbikes=80, n_bicycles=8, n_cars=12, n_walkers=50, avoid=None, seed=0):
         self.client, self.world, self.rng = client, world, random.Random(seed)
         self.map = world.get_map()  # get_map() re-downloads the whole OpenDRIVE map on every call
-        self.tm = client.get_trafficmanager(8000)
+        self.tm = client.get_trafficmanager(TM_PORT)
         self.tm.set_hybrid_physics_mode(True)  # no physics for TM vehicles far from the ego ('hero'): fewer pile-ups, faster
         self.tm.set_hybrid_physics_radius(70.0)
         bl = world.get_blueprint_library()
@@ -66,7 +67,7 @@ class VNTraffic:
         if v is None:
             return None
         lights, signs, gap, speed = STYLE[kind]
-        v.set_autopilot(True, 8000)
+        v.set_autopilot(True, TM_PORT)
         self.tm.ignore_lights_percentage(v, lights)
         self.tm.ignore_signs_percentage(v, signs)
         self.tm.distance_to_leading_vehicle(v, self.rng.uniform(*gap))
@@ -272,6 +273,7 @@ class Rider:
         self.env, self.wp, self.plan, self.life, self.t, self.v = env, wp, plan, life, 0.0, vehicle
         self.last_control = None
         self.merging = False
+        self.reckless = False  # True: ignores the clearance check (a darting bike does not wait for a gap)
         if vehicle is None:
             bp = env.world.get_blueprint_library().find(random.choice(MOTORBIKES))
             tr = carla.Transform(_offset(wp, plan(self)[0]) + carla.Location(z=0.5), wp.transform.rotation)
@@ -304,7 +306,7 @@ class Rider:
             if not self.merging:  # 3 s back to the lane centre first: the TM strands vehicles it finds off the lane
                 self.merging, self.life, self.plan = True, self.life + 3.0, lambda r: (0.0, 18.0)
             else:
-                self.v.set_autopilot(True, 8000)
+                self.v.set_autopilot(True, TM_PORT)
                 return False
         loc = self.v.get_location()
         for _ in range(20):  # advance the reference waypoint along its lane
@@ -315,14 +317,14 @@ class Rider:
             self.wp = nxt[0]
         plan = self.plan(self)
         if plan is None:  # plan is over (e.g. light turned green)
-            self.v.set_autopilot(True, 8000)
+            self.v.set_autopilot(True, TM_PORT)
             return False
         offset, speed = plan
-        if self._blocked(loc, self.v.get_transform()):
+        if not self.reckless and self._blocked(loc, self.v.get_transform()):
             speed = 0.0  # never ride into someone: stacked bikes are what launches them into the air
         ahead = self.wp.next(5.0)
         if not ahead:
-            self.v.set_autopilot(True, 8000)
+            self.v.set_autopilot(True, TM_PORT)
             return False
         target, t = _offset(ahead[0], offset), self.v.get_transform()
         fwd = t.get_forward_vector()
@@ -464,5 +466,51 @@ def surround(env):
     return riders
 
 
+def occluded(env):
+    '''
+    The occlusion test: a truck parked half on the kerb ~28 m ahead, a motorbike waiting right in front of it (hidden
+    from the ego) darts across the lane when the ego is 11 m away (~2 s at 20 km/h). Straight road only: in a junction
+    the bike would follow a turning lane instead of crossing. Returns the bike Rider (its .truck is the truck).
+    '''
+    i, route = env.current_waypoint_index, env.route_waypoints  # on the ego's own route (1 m spacing), not just its lane
+    bl = env.world.get_blueprint_library()
+    truck = None
+    for along in (28, 25, 31, 22, 34):  # first spot along the route with room for the truck (lamp posts, hydrants...)
+        if i + along + 10 >= len(route) or any(w.is_junction for w in route[i + along - 6:i + along + 10]):
+            continue
+        wp = route[i + along]
+        for off in (0.8, 0.5, 1.1):  # onto the kerb; less than 0.5 and the truck itself blocks the ego's lane
+            tr = carla.Transform(_offset(wp, wp.lane_width / 2 + off) + carla.Location(z=0.5), wp.transform.rotation)
+            truck = env.world.try_spawn_actor(bl.find('vehicle.carlamotors.carlacola'), tr)
+            if truck:
+                break
+        if truck:
+            break
+    if not truck:
+        return None
+    truck.apply_control(carla.VehicleControl(hand_brake=True))
+    env.actor_list.append(truck)
+    ahead = [route[i + along + 5]]
+    # bike at the lane edge: behind the truck's inner side as seen from the ego (the truck reaches lane_width/2 + off - 1.3);
+    # further out it would stand on the kerb (cannot spawn there, and a bike steering hard on it stays stuck)
+    kerb, far = wp.lane_width / 2, -(wp.lane_width / 2 + 0.8)
+    go = {}
+
+    def plan(r):
+        if 'at' not in go:
+            if r.v is None or _ahead_of_ego(env, r.v) > 11:
+                return kerb, 0.0  # waiting behind the truck's nose
+            go['at'] = r.t
+            f, rt = wp.transform.get_forward_vector(), wp.transform.get_right_vector()  # already revving: 0.9.10 bikes
+            r.v.set_target_velocity(carla.Vector3D(3 * f.x - 3 * rt.x, 3 * f.y - 3 * rt.y, 0))  # take >1 s from a standstill
+        k = min(1.0, (r.t - go['at']) / 1.3)
+        return kerb + (far - kerb) * k, 18.0
+    # life 60 s: if it ran out while the bike still waits, its merge-back would steer it into the ego lane (seen in v2i runs)
+    bike = Rider(env, ahead[0], plan, life=60)
+    if bike:
+        bike.truck, bike.go, bike.reckless = truck, go, True
+    return bike
+
+
 EVENTS = {'cutin': cutin, 'encroach': encroach, 'overtake': overtake, 'suddenstop': suddenstop, 'jaywalk': jaywalk,
-          'swerve': swerve, 'wrongway': wrongway, 'pullout': pullout, 'zigzag': zigzag, 'flock': flock, 'surround': surround}
+          'swerve': swerve, 'wrongway': wrongway, 'pullout': pullout, 'zigzag': zigzag, 'flock': flock, 'surround': surround, 'occluded': occluded}

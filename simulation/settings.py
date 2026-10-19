@@ -27,11 +27,15 @@ SSC_CAMERA = 'sensor.camera.semantic_segmentation'
 
 # Cooperative lidar (CODD-style). COOP_SECTORS = 0 turns it off and keeps the original 100-dim obs (pretrained PPO).
 COOP_SECTORS = 16
+# Traffic Manager port. The TM lives inside the first client process that uses it and dies with it, while the server
+# keeps pointing at the port: a second script on the same port then hangs. Give each concurrent/consecutive run its own.
+import os
+TM_PORT = int(os.environ.get('COOP_TM_PORT', '8000'))
 COOP_VEHICLES = 5
 COOP_RANGE = 50.0
 COOP_CORRIDOR = 20.0  # lane-ahead obstacle check length (m), one extra obs value
 # (sectors + corridor) now and their change since the last step, + the V2X view from the infrastructure (zeros if off)
-INFRA_DIM = 22  # = simulation.infrastructure.INFRA_DIM
+INFRA_DIM = 24  # = simulation.infrastructure.INFRA_DIM
 COOP_OBS = 2 * (COOP_SECTORS + 1) + INFRA_DIM if COOP_SECTORS else 0
 LIDAR_CHANNELS = 32
 LIDAR_LOWER_FOV = -25.0

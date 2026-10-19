@@ -35,6 +35,9 @@ def expert_action(env, lookahead=6):
     target_speed = min(20.0, max(0.0, (env.front_obstacle - 4.0) * 1.5))  # creep with the flow: VN traffic never leaves 7 m
     if env.vehicle.is_at_traffic_light() and env.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
         target_speed = 0.0  # only reachable in --vn mode, elsewhere the env turns the ego's lights green
+    warn = env.infra.warning_now() if getattr(env, 'infra', None) else None
+    if warn is not None:  # DENM from the junction edge server: someone will cut our path in `warn` s
+        target_speed = min(target_speed, 0.0 if warn < 1.5 else 6.0)
     if target_speed < 1:
         pedal = -1.0
     elif env.velocity > target_speed + 2:

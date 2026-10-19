@@ -1,5 +1,6 @@
 '''Scripted traffic situations on the route ahead of the ego (dashboard keys 1/2/3, BC data collection).'''
 from simulation.connection import carla
+from simulation.settings import TM_PORT
 
 NAMES = {1: 'Người băng qua đường', 2: 'Xe chạy chậm phía trước', 3: 'Xe đỗ chắn đường'}
 
@@ -18,9 +19,9 @@ def spawn_scenario(env, kind):
         tr = carla.Transform(wp.location + carla.Location(z=0.5), wp.rotation)
         actor = env.world.try_spawn_actor(bl.filter('vehicle.audi.a2')[0], tr)
         if actor and kind == 2:
-            actor.set_autopilot(True, 8000)
-            env.client.get_trafficmanager(8000).vehicle_percentage_speed_difference(actor, 70)  # 70 % slower
-            env.client.get_trafficmanager(8000).ignore_signs_percentage(actor, 100)  # slow, but never parked at a stop sign
+            actor.set_autopilot(True, TM_PORT)
+            env.client.get_trafficmanager(TM_PORT).vehicle_percentage_speed_difference(actor, 70)  # 70 % slower
+            env.client.get_trafficmanager(TM_PORT).ignore_signs_percentage(actor, 100)  # slow, but never parked at a stop sign
         elif actor:
             actor.apply_control(carla.VehicleControl(hand_brake=True))
     if actor:

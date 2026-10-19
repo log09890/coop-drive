@@ -132,7 +132,8 @@ class CollisionSensor:
 
 class LidarSensor:
 
-    def __init__(self, vehicle, transform=None, world=None, lower_fov=LIDAR_LOWER_FOV) -> None:
+    def __init__(self, vehicle, transform=None, world=None, lower_fov=LIDAR_LOWER_FOV, channels=LIDAR_CHANNELS,
+                 points_per_second=LIDAR_POINTS_PER_SECOND, upper_fov=None) -> None:
         '''On a vehicle (CODD mounting), or vehicle=None: a fixed sensor at `transform`, e.g. a roadside unit pole.'''
         self.parent = vehicle
         self.latest = None  # (points [N,4] in sensor frame, sensor pose x,y,z,pitch,yaw,roll)
@@ -144,7 +145,7 @@ class LidarSensor:
             transform = carla.Transform(carla.Location(z=self.height))
         else:
             self.height = transform.location.z
-        self.lower_fov = lower_fov
+        self.lower_fov, self.channels, self.pps, self.upper_fov = lower_fov, channels, points_per_second, upper_fov
         self.sensor = self._set_lidar_sensor(world, transform)
         weak_self = weakref.ref(self)
         self.sensor.listen(lambda data: LidarSensor._on_scan(weak_self, data))
@@ -154,10 +155,12 @@ class LidarSensor:
         lidar_bp.set_attribute('dropoff_general_rate', '0.0')
         lidar_bp.set_attribute('dropoff_intensity_limit', '1.0')
         lidar_bp.set_attribute('dropoff_zero_intensity', '0.0')
-        lidar_bp.set_attribute('channels', str(LIDAR_CHANNELS))
+        lidar_bp.set_attribute('channels', str(self.channels))
         lidar_bp.set_attribute('lower_fov', str(self.lower_fov))
         lidar_bp.set_attribute('range', str(COOP_RANGE))
-        lidar_bp.set_attribute('points_per_second', str(LIDAR_POINTS_PER_SECOND))
+        lidar_bp.set_attribute('points_per_second', str(self.pps))
+        if self.upper_fov is not None:
+            lidar_bp.set_attribute('upper_fov', str(self.upper_fov))
         lidar_bp.set_attribute('rotation_frequency', '20')  # one full turn per 0.05 s sync tick
         return world.spawn_actor(lidar_bp, transform, attach_to=self.parent) if self.parent else world.spawn_actor(lidar_bp, transform)
 

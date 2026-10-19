@@ -39,7 +39,7 @@ HELP = [
     ('/density <n>', 'number of motorbikes (kept around the ego)'),
     ('/driver expert|ppo', 'who drives'),
     ('/weather <name>', ' '.join(WEATHER)),
-    ('/v2x <key> <value>', 'latency <ms> · loss <%> · range <m> · gps <m> · on · off  (needs --infra)'),
+    ('/v2x <key> <value>', 'latency <ms> · loss <%> · range <m> · gps <m> · cars|bikes <% fitted> · on · off'),
     ('/pause', 'freeze / resume the simulation'),
     ('/reset', 'new episode'),
     ('/replay', 'play back the last ~10 s (also automatic after a collision)'),
@@ -54,7 +54,7 @@ PANELS = {'camera': (0, HEAD, *BIG), 'lidar': (BIG[0], HEAD, *BIG), 'sensors': (
           'policy': (CELL[0], HEAD + BIG[1] + 2, *CELL), 'reward': (2 * CELL[0], HEAD + BIG[1] + 2, *CELL),
           'traffic': (3 * CELL[0], HEAD + BIG[1] + 2, *CELL)}
 COMPLETE = {'spawn': sorted(SCENARIOS) + sorted(EVENTS), 'weather': sorted(WEATHER), 'driver': ['expert', 'ppo'],
-            'focus': sorted(PANELS) + ['off'], 'chaos': ['on', 'off'], 'v2x': ['latency', 'loss', 'range', 'gps', 'on', 'off']}
+            'focus': sorted(PANELS) + ['off'], 'chaos': ['on', 'off'], 'v2x': ['latency', 'loss', 'range', 'gps', 'cars', 'bikes', 'on', 'off']}
 BEV = (300, 180)  # top-down camera: 40 m up, 70 deg fov -> 56 m wide
 BEV_PX_PER_M = BEV[0] / (2 * 40 * math.tan(math.radians(35)))
 
@@ -216,6 +216,10 @@ class Dashboard:
     def after_step(self, env):
         '''Session metrics, timeline events and collisions for one simulation step.'''
         self.sim_t += 0.05
+        w = env.infra.warning if env.infra else None
+        if w and w['t'] - getattr(self, 'last_denm', -9) > 1.0:  # one mark per warning burst
+            self.last_denm = w['t']
+            self.mark('denm', w['kind'])
         for kind in self.metrics.step(env.velocity, env.front_obstacle, env.red_moving):
             self.mark(kind)
         if self.hits:
@@ -321,8 +325,12 @@ class Dashboard:
                 ch.range = val
             elif key == 'gps' and val is not None:
                 env.infra.gps_sigma = val
+            elif key in ('cars', 'bikes') and val is not None:  # share of vehicles fitted with V2X (send CAM)
+                setattr(env.infra, 'cam_' + key, min(val, 100) / 100)
+                env.infra.connected = {}
             return self.log(f"v2x {'on' if env.infra.enabled else 'off'} · {ch.latency * 1000:.0f} ms · loss {ch.loss * 100:.0f}% · "
-                            f"range {ch.range:.0f} m · gps {env.infra.gps_sigma:.1f} m")
+                            f"range {ch.range:.0f} m · gps {env.infra.gps_sigma:.1f} m · fitted cars {env.infra.cam_cars * 100:.0f}% "
+                            f"bikes {env.infra.cam_bikes * 100:.0f}%")
         if cmd == 'replay':
             return self.start_replay()
         if cmd == 'gif':
@@ -562,13 +570,20 @@ class Dashboard:
             for r in env.infra.rsus:
                 p = to_ego(r['xy'][0] - t.location.x, r['xy'][1] - t.location.y)
                 pygame.draw.rect(s, YELLOW, (mx + p[1] * scale - 5, my - p[0] * scale - 5, 10, 10), 2)
+            if env.infra.warning_now() is not None:
+                w = env.infra.warning
+                p = to_ego(w['x'] - t.location.x, w['y'] - t.location.y)
+                cx_, cy_ = mx + p[1] * scale, my - p[0] * scale
+                pygame.draw.line(s, RED, (cx_ - 7, cy_ - 7), (cx_ + 7, cy_ + 7), 3)
+                pygame.draw.line(s, RED, (cx_ - 7, cy_ + 7), (cx_ + 7, cy_ - 7), 3)
             for o in env.infra.known.values():
                 age = env.infra.t - o['t']
                 p = to_ego(o['x'] + o['vx'] * age - t.location.x, o['y'] + o['vy'] * age - t.location.y)
                 pygame.draw.rect(s, (120, 255, 255), (mx + p[1] * scale - 4, my - p[0] * scale - 4, 8, 8), 1)
         pygame.draw.polygon(s, FG, [(mx, my - 8), (mx - 5, my + 6), (mx + 5, my + 6)])
         s.set_clip(None)
-        labels = ([(f'Conflict in {worst[0]:.1f} s: {worst[1]}', RED)] if worst else []) + detect_situations(env)
+        denm = env.infra.warning_now() if env.infra else None
+        labels = ([(f"DENM: {env.infra.warning['kind']} cuts in {denm:.1f} s ({env.infra.warning['from']})", RED)] if denm is not None else [])             + ([(f'Conflict in {worst[0]:.1f} s: {worst[1]}', RED)] if worst else []) + detect_situations(env)
         for k, (label, col) in enumerate(labels[:5]):
             self.text('● ' + label, (x, y + 186 + k * 17), col, self.small)
 
@@ -588,7 +603,7 @@ class Dashboard:
             px = tx1 - (tx1 - tx0) * sec / 60
             pygame.draw.line(s, DIM, (px, ty - 3), (px, ty + 3), 1)
             self.text(f'-{sec}s' if sec else 'now', (px - 10, ty + 6), DIM, self.small)
-        styles = {'chaos': (CYAN, 9), 'near_miss': (ORANGE, 5), 'red_light': (YELLOW, 7), 'collision': (RED, 12), 'episode': (FG, 14)}
+        styles = {'denm': (RED, 10), 'chaos': (CYAN, 9), 'near_miss': (ORANGE, 5), 'red_light': (YELLOW, 7), 'collision': (RED, 12), 'episode': (FG, 14)}
         for k, (ts, kind, label) in enumerate(self.timeline):
             px = tx1 - (tx1 - tx0) * (self.sim_t - ts) / 60
             col, hgt = styles.get(kind, (DIM, 5))

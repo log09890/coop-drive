@@ -7,16 +7,7 @@ import torch
 DT = 0.05
 
 
-def closest_approach(p, v, horizon=3.0):
-    '''
-    Constant-velocity conflict check. p: other position relative to the ego (m), v: other velocity relative to the
-    ego (m/s), both [N, 2]. Returns (t, d): time of closest approach in [0, horizon] s and the distance then (m).
-    '''
-    p, v = np.atleast_2d(np.asarray(p, float)), np.atleast_2d(np.asarray(v, float))
-    vv = (v * v).sum(1)
-    t = np.where(vv > 1e-6, -(p * v).sum(1) / np.maximum(vv, 1e-6), 0.0)
-    t = np.clip(t, 0.0, horizon)
-    return t, np.linalg.norm(p + v * t[:, None], axis=1)
+from simulation.infrastructure import closest_approach  # noqa: F401  (shared with the edge server)
 
 
 def input_sensitivity(actor, obs):
@@ -43,8 +34,9 @@ def group_sensitivity(s, latent, n_sectors):
     g['motion (deltas)'] = s[c + n_sectors + 1:c + 2 * (n_sectors + 1)].sum()
     rest = s[c + 2 * (n_sectors + 1):]  # infrastructure part, if the observation has one
     if len(rest):
-        g['V2X objects'] = rest[:-6].sum()
-        g['traffic light (SPaT)'] = rest[-6:-1].sum()
+        g['V2X objects'] = rest[:-8].sum()
+        g['traffic light (SPaT)'] = rest[-8:-3].sum()
+        g['DENM warning'] = rest[-3:-1].sum()
     return g
 
 

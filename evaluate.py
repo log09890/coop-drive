@@ -19,6 +19,7 @@ from encoder_init import EncodeState
 from networks.on_policy.ppo.agent import PPOAgent
 from parameters import LATENT_DIM
 from bc import expert_action
+from simulation.settings import TM_PORT
 
 DT = 0.05
 
@@ -52,7 +53,7 @@ def main():
     args = p.parse_args()
 
     client, world = ClientConnection(args.town).setup()
-    client.get_trafficmanager(8000).set_random_device_seed(args.seed)
+    client.get_trafficmanager(TM_PORT).set_random_device_seed(args.seed)
     random.seed(args.seed); np.random.seed(args.seed)
     env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, share=not args.no_share, infra=args.infra)
     encode = EncodeState(LATENT_DIM)

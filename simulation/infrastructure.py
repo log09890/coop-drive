@@ -5,6 +5,7 @@ channel, and the messages the ego receives through it.
   CAM   cooperative awareness: every coop car broadcasts its own position (GPS noise) and velocity
   CPM   collective perception: each RSU broadcasts the objects its LiDAR extracts (position, velocity, kind)
   SPaT  signal phase and timing: traffic lights broadcast their state and the seconds left in it
+  DENM  decentralized environmental notification: the edge server at a junction warns the ego of a coming conflict
 
 The top half is pure numpy (tested in test_coop.py); the CARLA side (Infrastructure) is at the bottom.
 '''
@@ -14,7 +15,8 @@ from collections import deque
 import numpy as np
 
 INFRA_K = 4  # nearest V2X objects in the observation
-INFRA_DIM = INFRA_K * 4 + 5 + 1  # objects (fwd, right, v_fwd, v_right) + light ahead (dist, red, yellow, green, t_left) + age
+INFRA_DIM = INFRA_K * 4 + 5 + 2 + 1  # objects (fwd, right, v_fwd, v_right) + light (dist, red, yellow, green, t_left)
+#                                     + DENM warning (active, time to conflict) + staleness
 
 
 # ------------------------------------------------------------------------------------------------- V2X channel
@@ -28,25 +30,31 @@ class V2XChannel:
         self.stats = deque(maxlen=400)  # (t, delivered?, latency) of recent messages, for the dashboard
 
     def send(self, t, sender_xy, msg):
-        if self.rng.random() < self.loss:
-            self.stats.append((t, False, 0.0))
-            return
         delay = max(0.0, self.latency + self.rng.uniform(-self.jitter, self.jitter))
         self.queue.append((t + delay, sender_xy, msg))
 
-    def receive(self, t, receiver_xy):
-        '''Messages due by time t from senders within range; out-of-range ones count as lost.'''
+    def receive_all(self, t, receivers):
+        '''receivers: {name: (x, y)}. Messages due by time t, per receiver: in range and not lost (independently).'''
         due, keep = [], []
         for item in self.queue:
             (due if item[0] <= t else keep).append(item)
         self.queue = keep
-        out = []
+        out = {name: [] for name in receivers}
         for at, (sx, sy), msg in due:
-            ok = math.hypot(sx - receiver_xy[0], sy - receiver_xy[1]) <= self.range
-            self.stats.append((t, ok, at - msg['t']))
-            if ok:
-                out.append(msg)
+            for name, (rx, ry) in receivers.items():
+                if msg.get('to') not in (None, name):  # unicast (DENM) only to its addressee
+                    continue
+                if math.hypot(sx - rx, sy - ry) > self.range:
+                    continue
+                ok = self.rng.random() >= self.loss
+                if name == 'ego':
+                    self.stats.append((t, ok, at - msg['t']))
+                if ok:
+                    out[name].append(msg)
         return out
+
+    def receive(self, t, receiver_xy):
+        return self.receive_all(t, {'ego': receiver_xy})['ego']
 
     def summary(self, t, window=2.0):
         '''Messages per second, delivered share and mean latency over the last `window` s.'''
@@ -54,6 +62,46 @@ class V2XChannel:
         ok = [s for s in recent if s[1]]
         return {'msg_per_s': len(ok) / window, 'loss': 1 - len(ok) / len(recent) if recent else 0.0,
                 'latency_ms': 1000 * float(np.mean([s[2] for s in ok])) if ok else 0.0}
+
+
+def closest_approach(p, v, horizon=3.0):
+    '''
+    Constant-velocity conflict check. p: other position relative to the ego (m), v: other velocity relative to the
+    ego (m/s), both [N, 2]. Returns (t, d): time of closest approach in [0, horizon] s and the distance then (m).
+    '''
+    p, v = np.atleast_2d(np.asarray(p, float)), np.atleast_2d(np.asarray(v, float))
+    vv = (v * v).sum(1)
+    t = np.where(vv > 1e-6, -(p * v).sum(1) / np.maximum(vv, 1e-6), 0.0)
+    t = np.clip(t, 0.0, horizon)
+    return t, np.linalg.norm(p + v * t[:, None], axis=1)
+
+
+def dedupe(objects, radius=1.5):
+    '''One entry per physical object: the same bike reported by an RSU and a CAM (or two RSUs) is merged, freshest wins.'''
+    out = []
+    for o in sorted(objects, key=lambda o: -o['t']):
+        if all(math.hypot(o['x'] - q['x'], o['y'] - q['y']) > radius for q in out):
+            out.append(o)
+    return out
+
+
+def edge_conflicts(ego, others, horizon=3.0, radius=1.5):
+    '''
+    Edge server check: ego = (x, y, vx, vy, yaw_deg) from its CAM, others = [{'x','y','vx','vy',...}].
+    Conflicts ahead of the ego (meeting point in front of it) within `horizon` s and `radius` m, soonest first.
+    '''
+    if not others:
+        return []
+    ex, ey, evx, evy, yaw = ego
+    p = np.array([(o['x'] - ex, o['y'] - ey) for o in others])
+    v = np.array([(o['vx'] - evx, o['vy'] - evy) for o in others])
+    t, d = closest_approach(p, v, horizon)
+    meet = p + v * t[:, None] + np.array([evx, evy]) * t[:, None]  # where the other is then, relative to the ego now
+    fwd = np.array([math.cos(math.radians(yaw)), math.sin(math.radians(yaw))])
+    moving = np.array([math.hypot(o['vx'], o['vy']) > 1.0 for o in others])  # parked things are the ego's corridor's job;
+    hits = [(float(t[i]), float(d[i]), others[i]) for i in range(len(others))  # with GPS noise they only raise false alarms
+            if moving[i] and d[i] < radius and 0 < t[i] < horizon and meet[i] @ fwd > 0]
+    return sorted(hits, key=lambda h: h[0])
 
 
 # ------------------------------------------------------------------------------------------------- RSU perception
@@ -68,16 +116,20 @@ class ObjectExtractor:
         self.background = {}  # cell -> long-term occupancy in [0, 1]
         self.tracks = {}  # id -> (x, y, vx, vy, t)
         self.next_id = 0
+        self.held = set()  # cells kept out of the background: a bike waiting at the kerb must stay an object
+        self.born, self.moved, self.t0, self.warmup = {}, set(), None, 3.0
 
     def __call__(self, pts, ground_z, t):
         '''pts: [N, 3] world points. Returns [{'id', 'x', 'y', 'vx', 'vy', 'kind'}].'''
+        self.t0 = t if self.t0 is None else self.t0
         pts = np.asarray(pts, float).reshape(-1, 3)
         pts = pts[(pts[:, 2] > ground_z + self.z_min) & (pts[:, 2] < ground_z + self.z_max)]
         cells = {}
         for c, p in zip(map(tuple, np.floor(pts[:, :2] / self.cell).astype(int)), pts):
             cells.setdefault(c, []).append(p)
         for c in set(self.background) | set(cells):  # exponential average of "this cell is occupied"
-            self.background[c] = self.background.get(c, 0.0) * (1 - self.rate) + self.rate * (c in cells)
+            occupied = c in cells and c not in self.held
+            self.background[c] = self.background.get(c, 0.0) * (1 - self.rate) + self.rate * occupied
         moving = {c for c in cells if self.background.get(c, 0.0) < 0.5}
         objects, seen = [], set()
         for c in moving:  # flood fill 8-connected cells into clusters
@@ -99,8 +151,19 @@ class ObjectExtractor:
             if len(p) < 4 or extent.max() > self.max_extent:  # noise, or a building edge the background missed
                 continue
             kind = 'car' if extent.max() > 2.8 else 'two-wheeler' if extent.max() > 1.2 else 'pedestrian'
-            objects.append({'x': float(p[:, 0].mean()), 'y': float(p[:, 1].mean()), 'kind': kind})
-        return self._track(objects, t)
+            objects.append({'x': float(p[:, 0].mean()), 'y': float(p[:, 1].mean()), 'kind': kind, 'cells': group})
+        out = self._track(objects, t)
+        # hold only what arrived after the start-up (or ever moved): clutter seen from the first frame (poles, bins,
+        # trees) must still turn into background, a truck parking or a bike stopping later must not
+        self.held = set()
+        for o in out:
+            if math.hypot(o['vx'], o['vy']) > 0.5:
+                self.moved.add(o['id'])
+            if self.born[o['id']] > self.t0 + self.warmup or o['id'] in self.moved:
+                self.held.update((gx + dx, gy + dy) for gx, gy in o['cells'] for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+        for o in out:
+            del o['cells']
+        return out
 
     def _track(self, objects, t, gate=2.5):
         '''Nearest-neighbour association with the previous frame; velocity smoothed over frames.'''
@@ -113,6 +176,7 @@ class ObjectExtractor:
                     best, bd = tid, d
             if best is None:
                 best, vx, vy = self.next_id, 0.0, 0.0
+                self.born[best] = t
                 self.next_id += 1
             else:
                 x, y, pvx, pvy, tt = self.tracks[best]
@@ -144,10 +208,11 @@ def group_red_left(me, active, active_left, phases, clearance=0.0):
     return left
 
 
-def encode_infra_obs(ego_xy, ego_yaw_deg, ego_v, objects, now, light=None, max_age=1.0):
+def encode_infra_obs(ego_xy, ego_yaw_deg, ego_v, objects, now, light=None, max_age=1.0, warning=None):
     '''
     The ego's V2X view as INFRA_DIM numbers. objects: [{'x','y','vx','vy','t'}] in world, extrapolated to `now`
-    with their own velocity; light: (distance to stop line m, state, seconds left) or None.
+    with their own velocity; light: (distance to stop line m, state, seconds left) or None;
+    warning: seconds to the conflict announced by a DENM, or None.
     '''
     yaw = math.radians(ego_yaw_deg)
     c, s = math.cos(yaw), math.sin(yaw)
@@ -168,6 +233,7 @@ def encode_infra_obs(ego_xy, ego_yaw_deg, ego_v, objects, now, light=None, max_a
     else:
         dist, state, left = light
         feats += [min(dist, 50) / 50, state == 'Red', state == 'Yellow', state == 'Green', min(left, 30) / 30]
+    feats += [0.0, 1.0] if warning is None else [1.0, min(warning, 3.0) / 3.0]
     feats.append(min(np.mean(ages) if ages else max_age, max_age) / max_age)  # how stale the V2X picture is
     return np.array(feats, np.float32)
 
@@ -176,12 +242,14 @@ def encode_infra_obs(ego_xy, ego_yaw_deg, ego_v, objects, now, light=None, max_a
 class Infrastructure:
     '''RSUs at the junctions, CAM from coop cars, SPaT from lights, all through one V2X channel to the ego.'''
 
-    def __init__(self, world, rsu_height=6.0, max_rsus=8, gps_sigma=1.5, seed=0, **channel):
+    def __init__(self, world, rsu_height=6.0, max_rsus=8, gps_sigma=1.5, seed=0, cam_cars=1.0, cam_bikes=0.0, **channel):
+        '''cam_cars / cam_bikes: share of cars / two-wheelers fitted with V2X (Vietnamese motorbikes: practically none).'''
         from simulation.connection import carla
         from simulation.sensors import LidarSensor
         self.world, self.map, self.carla = world, world.get_map(), carla
         self.channel = V2XChannel(seed=seed, **channel)
         self.gps_sigma, self.rng = gps_sigma, random.Random(seed)
+        self.cam_cars, self.cam_bikes, self.connected = cam_cars, cam_bikes, {}  # vehicle id -> fitted with V2X?
         self.enabled = True
         junctions = {}
         for wp in self.map.generate_waypoints(4.0):
@@ -191,8 +259,10 @@ class Infrastructure:
         self.rsus = []
         for jid, loc in list(junctions.items())[:max_rsus]:
             ground = self.map.get_waypoint(loc).transform.location.z
-            # -40 deg: from a 6 m pole the blind disc under it shrinks from ~13 m (-25 deg) to ~7 m
-            sensor = LidarSensor(None, carla.Transform(carla.Location(loc.x, loc.y, ground + rsu_height)), world=world, lower_fov=-40.0)
+            # infrastructure-grade LiDAR: 64 channels all aimed at the street (0 .. -40 deg; the blind disc under a 6 m pole
+            # shrinks from ~13 m at -25 deg to ~7 m), 200k pts/s: a motorbike 20 m away gets ~10 points instead of 1-2
+            sensor = LidarSensor(None, carla.Transform(carla.Location(loc.x, loc.y, ground + rsu_height)), world=world,
+                                 lower_fov=-40.0, upper_fov=0.0, channels=64, points_per_second=200000)
             self.rsus.append({'junction': jid, 'xy': (loc.x, loc.y), 'ground': ground, 'lidar': sensor,
                               'extract': ObjectExtractor(), 'objects': []})
         self.lights = []  # (light, stop-line waypoint)
@@ -201,6 +271,8 @@ class Infrastructure:
             self.lights.append((tl, _stop_waypoint(self.map, tl)))
         self.known = {}  # (sender, object id) -> object, the ego's V2X world model
         self.light_ahead = None
+        self.warning = None  # latest DENM for the ego
+        self.edge_cams = {}  # rsu name -> {vehicle id: CAM object}, what each edge server heard
         self.t = 0.0
         self.ticks = 0
 
@@ -208,7 +280,21 @@ class Infrastructure:
         return [r['lidar'].sensor for r in self.rsus]
 
     def reset(self):
-        self.known, self.light_ahead = {}, None
+        self.known, self.light_ahead, self.warning = {}, None, None
+
+    def _fitted(self, v):
+        if v.id not in self.connected:
+            from simulation.vn_traffic import MOTORBIKES, BICYCLES
+            share = self.cam_bikes if v.type_id in MOTORBIKES + BICYCLES else self.cam_cars
+            self.connected[v.id] = self.rng.random() < share
+        return self.connected[v.id]
+
+    def warning_now(self):
+        '''Seconds to the conflict of the latest DENM, if still ahead and fresh, else None.'''
+        if not self.warning:
+            return None
+        left = self.warning['ttc'] - (self.t - self.warning['t'])
+        return left if left > 0 and self.t - self.warning['t'] < 1.0 else None
 
     def update(self, env):
         '''Once per tick (0.05 s): RSU perception + CPM at 10 Hz, CAM at 10 Hz, SPaT at 2 Hz, ego receives.'''
@@ -225,13 +311,12 @@ class Infrastructure:
                 r['objects'] = r['extract'](pts, r['ground'], self.t)
                 self.channel.send(self.t, r['xy'], {'type': 'CPM', 'from': f"rsu{r['junction']}", 't': self.t,
                                                     'objects': r['objects']})
-            for i, l in enumerate(env.lidar_objs[1:]):  # coop cars: CAM with GPS noise
-                v = l.parent
-                if v is None or not v.is_alive:
+            for v in self.world.get_actors().filter('vehicle.*'):  # CAM from every V2X-fitted vehicle, the ego included
+                if not (v.id == env.vehicle.id or self._fitted(v)):
                     continue
-                loc, vel = v.get_location(), v.get_velocity()
+                loc, vel, yaw = v.get_location(), v.get_velocity(), v.get_transform().rotation.yaw
                 x, y = loc.x + self.rng.gauss(0, self.gps_sigma), loc.y + self.rng.gauss(0, self.gps_sigma)
-                self.channel.send(self.t, (loc.x, loc.y), {'type': 'CAM', 'from': f'car{v.id}', 't': self.t,
+                self.channel.send(self.t, (loc.x, loc.y), {'type': 'CAM', 'from': f'car{v.id}', 't': self.t, 'yaw': yaw,
                                                           'objects': [{'id': v.id, 'x': x, 'y': y, 'vx': vel.x, 'vy': vel.y, 'kind': 'car'}]})
         if self.ticks % 10 == 0:
             for tl, stop in self.lights:
@@ -243,10 +328,16 @@ class Infrastructure:
                 self.channel.send(self.t, (loc.x, loc.y), {'type': 'SPaT', 'from': f'tl{tl.id}', 't': self.t,
                                                           'light': tl.id, 'state': st, 'left': left, 'stop': (loc.x, loc.y)})
         ego = env.vehicle.get_location()
+        edges = [r for r in self.rsus if math.hypot(r['xy'][0] - ego.x, r['xy'][1] - ego.y) < 80]  # only these can matter
+        inbox = self.channel.receive_all(self.t, dict([('ego', (ego.x, ego.y))] + [(f"rsu{r['junction']}", r['xy']) for r in edges]))
+        for r in edges:
+            self._edge(r, inbox[f"rsu{r['junction']}"], env.vehicle.id)
         spats = {}
-        for m in self.channel.receive(self.t, (ego.x, ego.y)):
+        for m in inbox['ego']:
             if m['type'] == 'SPaT':
                 spats[m['light']] = m
+            elif m['type'] == 'DENM':
+                self.warning = m
             else:
                 for o in m['objects']:
                     if m['type'] == 'CAM' and o['id'] == env.vehicle.id:
@@ -257,6 +348,27 @@ class Infrastructure:
             self.light_ahead = self._light_on_route(env, spats) or self.light_ahead
         if self.light_ahead and self.t - self.light_ahead[3] > 1.5:
             self.light_ahead = None
+
+    def _edge(self, r, msgs, ego_id):
+        '''Edge server of one RSU: fuse its own LiDAR objects with the CAMs it heard, warn the ego of a conflict.'''
+        name = f"rsu{r['junction']}"
+        cams = self.edge_cams.setdefault(name, {})
+        for m in msgs:
+            if m['type'] == 'CAM':
+                o = m['objects'][0]
+                cams[o['id']] = dict(o, t=m['t'], yaw=m['yaw'])
+        cams = {k: o for k, o in cams.items() if self.t - o['t'] < 0.5}
+        self.edge_cams[name] = cams
+        me = cams.get(ego_id)
+        if me is None or self.ticks % 2:
+            return
+        others = [dict(o, t=self.t) for o in r['objects'] if math.hypot(o['x'] - me['x'], o['y'] - me['y']) > 3.0]  # not the ego itself
+        others += [o for k, o in cams.items() if k != ego_id]
+        hits = edge_conflicts((me['x'], me['y'], me['vx'], me['vy'], me['yaw']), dedupe(others))
+        if hits:
+            ttc, dist, o = hits[0]
+            self.channel.send(self.t, r['xy'], {'type': 'DENM', 'from': name, 'to': 'ego', 't': self.t, 'ttc': ttc,
+                                                'kind': o.get('kind', '?'), 'x': o['x'], 'y': o['y']})
 
     def _time_left(self, tl, state):
         '''Seconds left in the light's state; red waits for the other lights of its group to go round.'''
@@ -291,7 +403,8 @@ class Infrastructure:
         light = self.light_ahead[:3] if self.light_ahead else None
         if light:  # the distance was measured when the SPaT arrived: correct it by what the ego drove since
             light = (max(0.0, light[0] - env.velocity / 3.6 * (self.t - self.light_ahead[3])), light[1], max(0.0, light[2] - (self.t - self.light_ahead[3])))
-        return encode_infra_obs((t.location.x, t.location.y), t.rotation.yaw, (v.x, v.y), list(self.known.values()), self.t, light)
+        return encode_infra_obs((t.location.x, t.location.y), t.rotation.yaw, (v.x, v.y), dedupe(list(self.known.values())),
+                                self.t, light, warning=self.warning_now())
 
     def destroy(self, client):
         client.apply_batch_sync([self.carla.command.DestroyActor(s) for s in self.sensors()], True)

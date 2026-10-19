@@ -11,7 +11,7 @@ except IndexError:
     print('Couldn\'t import Carla egg properly')
 
 import carla
-from simulation.settings import PORT, TIMEOUT, HOST, COOP_SECTORS
+from simulation.settings import PORT, TIMEOUT, HOST, COOP_SECTORS, TM_PORT
 
 class ClientConnection:
     def __init__(self, town):
@@ -31,7 +31,7 @@ class ClientConnection:
             settings.synchronous_mode = bool(COOP_SECTORS)
             settings.fixed_delta_seconds = 0.05 if COOP_SECTORS else None
             self.world.apply_settings(settings)
-            self.client.get_trafficmanager(8000).set_synchronous_mode(bool(COOP_SECTORS))
+            self.client.get_trafficmanager(TM_PORT).set_synchronous_mode(bool(COOP_SECTORS))
             return self.client, self.world
 
         except Exception as e:

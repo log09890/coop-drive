@@ -101,3 +101,42 @@ from simulation.infrastructure import group_red_left
 assert group_red_left(3, 1, 4.5, [(4, 1.5)] * 4) == 4.5 + 5.5 and group_red_left(2, 1, 4.5, [(4, 1.5)] * 4) == 4.5
 assert group_red_left(3, 1, 4.5, [(4, 1.5)] * 4, clearance=2) == 4.5 + 2 + 5.5 + 2  # + an all-red gap per turn
 print('spat ok')
+
+from simulation.infrastructure import edge_conflicts, dedupe
+ego = (0, 0, 5, 0, 0.0)  # driving +x at 5 m/s
+crossing = {'x': 10, 'y': -5, 'vx': 0, 'vy': 2.5}  # reaches our line at x = 10 in 2 s, when we are there
+behind = {'x': -6, 'y': 0, 'vx': 6, 'vy': 0}  # catching up from behind: meets behind our nose -> no warning
+beside = {'x': 0, 'y': 3, 'vx': 5, 'vy': 0}  # riding along 3 m to the side
+hits = edge_conflicts(ego, [crossing, behind, beside])
+assert len(hits) == 1 and hits[0][2] is crossing and abs(hits[0][0] - 2) < 0.05, hits
+assert len(dedupe([{'x': 0, 'y': 0, 't': 1.0}, {'x': 0.8, 'y': 0, 't': 1.2}, {'x': 9, 'y': 0, 't': 1.0}])) == 2
+ch = V2XChannel(latency=0.0, jitter=0.0, loss=0.0)
+ch.send(0, (0, 0), {'t': 0, 'to': 'ego', 'type': 'DENM'}); ch.send(0, (0, 0), {'t': 0, 'type': 'CAM'})
+box = ch.receive_all(0.0, {'ego': (0, 0), 'rsu1': (5, 0)})
+assert len(box['ego']) == 2 and [m['type'] for m in box['rsu1']] == ['CAM']  # DENM is unicast
+w = encode_infra_obs((0, 0), 0.0, (0, 0), [], 0.0, warning=1.5)
+assert np.allclose(w[INFRA_K * 4 + 5:INFRA_K * 4 + 7], [1, 0.5])
+print('edge ok')
+
+from occlusion_eval import lead_time, summarize as occ_summary
+assert lead_time(1.0, 5.0, 6.0) == 1.0 and lead_time(5.5, 5.0, 6.0) == 0.5 and lead_time(6.5, 5.0, 6.0) == -0.5 and lead_time(None, 5.0, 6.0) is None
+s = occ_summary([{'lead': 1.0, 'aware_at_dart': True, 'collision': False, 'min_dist': 4}, {'lead': -0.5, 'aware_at_dart': False, 'collision': True, 'min_dist': 0.5},
+                 {'lead': None, 'aware_at_dart': False, 'collision': True, 'min_dist': 0.2}])
+assert s['aware_at_dart_%'] == 33.3 and s['aware_before_crossing_%'] == 33.3 and s['mean_lead_s'] == 0.25 and s['collision_%'] == 66.7
+print('occlusion ok')
+parked = {'x': 10, 'y': 0.5, 'vx': 0, 'vy': 0}  # parked right on our line: the corridor handles it, not a DENM
+assert edge_conflicts((0, 0, 5, 0, 0.0), [parked]) == []
+print('edge static ok')
+# a bike that stops for 10 s stays an object (its cells are held out of the background), a wall still becomes background
+ex = ObjectExtractor(background_rate=0.05)
+for k in range(300):  # the bike arrives after the 3 s start-up, then waits 10 s
+    objs = ex(np.r_[wall, bike(5.0)] if k >= 100 else wall, 0.0, k * 0.05)
+assert len(objs) == 1 and objs[0]['kind'] == 'two-wheeler', objs
+print('waiting bike ok')
+# clutter present from the first frame becomes background even though it is small; a bike that arrives later and waits stays
+ex = ObjectExtractor(background_rate=0.05)
+pole = np.array([[0, 10, z] for z in (0.5, 1.0, 1.5, 2.0)] + [[0.1, 10, z] for z in (0.5, 1.0, 1.5, 2.0)])
+for k in range(300):
+    objs = ex(np.r_[wall, pole] if k < 100 else np.r_[wall, pole, bike(5.0)], 0.0, k * 0.05)
+assert len(objs) == 1 and objs[0]['kind'] == 'two-wheeler', objs
+print('clutter ok')

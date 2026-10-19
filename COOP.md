@@ -55,6 +55,16 @@ Shortcut "Coop-Drive Infra" hoặc `dashboard.py --town Town02 --vn --infra`. `s
 - **Observation** thêm 22 số: 4 vật thể V2X gần nhất (vị trí, vận tốc tương đối, ngoại suy theo độ trễ), đèn phía trước trên tuyến (khoảng cách, màu, giây còn lại), độ "cũ" của thông tin. Không bật `--infra` thì 22 số này bằng 0 (cùng kiến trúc model). Model cũ (134 đầu vào) cần thu dữ liệu + BC lại (`bc.py collect/train --infra`).
 - Dashboard: LiDAR của RSU trong ô LiDAR (ô vuông vàng), vật thể biết qua V2X trong ô Traffic (ô vuông xanh), khối V2X trong ô Reward; `/v2x latency|loss|range|gps <giá trị>`, `/v2x on|off`.
 
+### Hạ tầng tự hành, giai đoạn 2: edge server, DENM, CAM cho mọi xe
+
+- **CAM cho mọi xe có trang bị V2X**: mặc định 100% ô tô, 0% xe máy (xe máy Việt Nam gần như không có thiết bị); `/v2x cars|bikes <%>`.
+- Kênh V2X giao tin **cho từng nơi nhận** (ego và các RSU), mất gói tính riêng từng cặp; DENM là tin gửi riêng (unicast).
+- **Edge server** ở mỗi RSU trong vòng 80 m quanh ego: gộp vật thể LiDAR của RSU với CAM nghe được (bỏ trùng), dự đoán xung đột phía trước ego (TTC < 3 s, cách < 1.5 m) → gửi **DENM**. Observation thêm 2 số (đang có cảnh báo, TTC) → 24 số hạ tầng.
+- Tài xế mẫu: DENM báo xung đột < 1.5 s → dừng, < 3 s → giảm còn 6 km/h.
+- Kịch bản `occluded` (`/spawn occluded`): xe tải đỗ lấn vỉa hè, xe máy chờ trước đầu xe tải, lao ngang làn khi ego còn 16 m.
+- `occlusion_eval.py --config ego|v2v|v2i|both --trials 10` → `results/occlusion_<config>.json`; `--table` in bảng so sánh: % biết lúc xe máy bắt đầu lao ra, % biết trước khi nó vào làn, số giây cảnh báo, % va chạm, khoảng cách gần nhất.
+- Dashboard: nhãn DENM màu đỏ, dấu X tại điểm xung đột dự đoán, vạch DENM trên dải thời gian.
+
 ### Reward, observation và đánh giá (chế độ coop)
 
 - Observation coop = (16 hướng + hành lang) **và độ thay đổi của chúng so với bước trước**, để agent thấy xe nào đang lao tới: 100 + 34 = 134 chiều.
