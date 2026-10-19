@@ -1,0 +1,153 @@
+{
+ "config": "both",
+ "summary": {
+  "trials": 10,
+  "aware_at_dart_%": 100.0,
+  "aware_before_crossing_%": 100.0,
+  "mean_lead_s": 1.33,
+  "collision_%": 0.0,
+  "mean_min_dist_m": 7.72
+ },
+ "trials": [
+  {
+   "trial": 0,
+   "aware": {
+    "own": 0.39999999999999997,
+    "shared": 0.05,
+    "v2x": 0.25
+   },
+   "t_go": 4.199999999999993,
+   "t_cross": 5.649999999999988,
+   "lead": 1.4499999999999948,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 7.18
+  },
+  {
+   "trial": 1,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": 0.15000000000000002
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 8.26
+  },
+  {
+   "trial": 2,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": 0.2
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 6.42
+  },
+  {
+   "trial": 3,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": 0.15000000000000002
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 8.7
+  },
+  {
+   "trial": 4,
+   "aware": {
+    "own": 1.950000000000001,
+    "shared": 0.05,
+    "v2x": 0.05
+   },
+   "t_go": 6.999999999999983,
+   "t_cross": 8.299999999999983,
+   "lead": 1.2999999999999998,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 7.72
+  },
+  {
+   "trial": 5,
+   "aware": {
+    "own": 1.2500000000000004,
+    "shared": 0.1,
+    "v2x": 0.2
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 9.17
+  },
+  {
+   "trial": 6,
+   "aware": {
+    "own": 0.8000000000000002,
+    "shared": 0.05,
+    "v2x": 0.15000000000000002
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.549999999999988,
+   "lead": 1.4499999999999948,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 9.09
+  },
+  {
+   "trial": 7,
+   "aware": {
+    "own": 1.3000000000000005,
+    "shared": 0.05,
+    "v2x": 0.2
+   },
+   "t_go": 4.199999999999993,
+   "t_cross": 5.4999999999999885,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 6.04
+  },
+  {
+   "trial": 8,
+   "aware": {
+    "own": 1.7500000000000009,
+    "shared": 0.05,
+    "v2x": 0.3
+   },
+   "t_go": 4.599999999999992,
+   "t_cross": 5.899999999999987,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 7.17
+  },
+  {
+   "trial": 9,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": 0.2
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 7.42
+  }
+ ]
+}

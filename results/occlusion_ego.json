@@ -1,0 +1,153 @@
+{
+ "config": "ego",
+ "summary": {
+  "trials": 10,
+  "aware_at_dart_%": 100.0,
+  "aware_before_crossing_%": 100.0,
+  "mean_lead_s": 1.33,
+  "collision_%": 0.0,
+  "mean_min_dist_m": 5.82
+ },
+ "trials": [
+  {
+   "trial": 0,
+   "aware": {
+    "own": 0.9000000000000002,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.199999999999993,
+   "t_cross": 5.649999999999988,
+   "lead": 1.4499999999999948,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.66
+  },
+  {
+   "trial": 1,
+   "aware": {
+    "own": 1.3500000000000005,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.149999999999993,
+   "t_cross": 5.449999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.97
+  },
+  {
+   "trial": 2,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.96
+  },
+  {
+   "trial": 3,
+   "aware": {
+    "own": 0.8000000000000002,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.96
+  },
+  {
+   "trial": 4,
+   "aware": {
+    "own": 1.3500000000000005,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.199999999999993,
+   "t_cross": 5.4999999999999885,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.62
+  },
+  {
+   "trial": 5,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.1,
+    "v2x": null
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.96
+  },
+  {
+   "trial": 6,
+   "aware": {
+    "own": 0.8000000000000002,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.549999999999988,
+   "lead": 1.4499999999999948,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.63
+  },
+  {
+   "trial": 7,
+   "aware": {
+    "own": 1.3500000000000005,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.199999999999993,
+   "t_cross": 5.4999999999999885,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.52
+  },
+  {
+   "trial": 8,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.96
+  },
+  {
+   "trial": 9,
+   "aware": {
+    "own": 1.2000000000000004,
+    "shared": 0.05,
+    "v2x": null
+   },
+   "t_go": 4.099999999999993,
+   "t_cross": 5.399999999999989,
+   "lead": 1.2999999999999954,
+   "aware_at_dart": true,
+   "collision": false,
+   "min_dist": 5.96
+  }
+ ]
+}
