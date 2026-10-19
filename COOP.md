@@ -46,16 +46,6 @@ Shortcut "Coop-Drive VN Traffic". `simulation/vn_traffic.py`:
 - Xe do script lái tự giữ khoảng cách theo kích thước xe; xe nào lật/bay được đặt lại trên đường; hybrid physics cho xe ở xa (> 70 m).
 - Train/thu dữ liệu trong môi trường này: `bc.py collect --town Town02 --vn`, `continuous_driver.py --town Town02 --vn-traffic`. Chạy khoảng 6–7 bước/giây với dashboard.
 
-### Bản đồ thật: Ngã Tư Sở (OpenStreetMap)
-
-Shortcut "Coop-Drive Nga Tu So" hoặc `dashboard.py --town NgaTuSo --vn`. Mọi `maps/<Tên>.xodr` đều được dựng thành world bằng `generate_opendrive_world`.
-- `osm_map.py file.osm maps/Ten.xodr`: OSM → OpenDRIVE (`carla.Osm2Odr`), làn 3.2 m, bỏ cầu vượt/đường trên cao (CARLA 0.9.10 không dựng được đường chồng nhau; `--elevated` giữ lại cho bản CARLA mới hơn).
-- Tường 3.5 m dọc mép đường làm mặt tiền và giữ xe không rơi khỏi mặt đường (map tự dựng không có mặt đất).
-- Không có đèn giao thông và lưới đi bộ (bật lưới làm sập server 0.9.10): người đi bộ được script cho băng qua đường quanh ego.
-- Camera semantic gần như đen trên mesh tự dựng (đường không có nhãn semantic): ở map này agent chỉ dựa được vào LiDAR; tài xế mẫu không bị ảnh hưởng.
-- Bộ dựng map của 0.9.10 hay lỗi ngẫu nhiên: tự thử lại 3 lần; `Dashboard.bat` khởi động lại server nếu nó sập.
-- Dữ liệu bản đồ © OpenStreetMap contributors, ODbL (xem `maps/README.md`).
-
 ### Reward, observation và đánh giá (chế độ coop)
 
 - Observation coop = (16 hướng + hành lang) **và độ thay đổi của chúng so với bước trước**, để agent thấy xe nào đang lao tới: 100 + 34 = 134 chiều.

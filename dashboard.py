@@ -279,7 +279,7 @@ class Dashboard:
 
     # ------------------------------------------------------------------ drawing
     def draw(self, env, obs, action, reward):
-        if env.timesteps % 5 == 0:  # keep the CARLA server window on the ego (generated maps are black away from the roads)
+        if env.timesteps % 5 == 0:  # keep the CARLA server window on the ego
             t = env.vehicle.get_transform()
             f = t.get_forward_vector()
             env.world.get_spectator().set_transform(carla.Transform(

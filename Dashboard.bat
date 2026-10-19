@@ -1,6 +1,6 @@
 @echo off
-rem Double-click: starts CARLA if needed, waits for it, opens the Coop-Drive dashboard. Extra args go to dashboard.py (e.g. --town NgaTuSo --vn).
-rem If the server dies (the 0.9.10 OpenDRIVE generator sometimes takes it down), it is restarted and the dashboard retried, 3 times.
+rem Double-click: starts CARLA if needed, waits for it, opens the Coop-Drive dashboard. Extra args go to dashboard.py (e.g. --town Town02 --vn).
+rem If the server dies, it is restarted and the dashboard retried, 3 times.
 chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 cd /d "%~dp0"

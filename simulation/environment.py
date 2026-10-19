@@ -88,9 +88,9 @@ class CarlaEnvironment():
                     transform = random.choice(self.map.get_spawn_points())
             else:
                 self.total_distance = 250
-                transform = self.long_route_spawn(150)  # OSM maps: many spawn points sit right before a dead end
+                transform = self.long_route_spawn(150)  # not right before a dead end
 
-            # generated (OSM) maps put spawn points ~1.5 m above the asphalt: the drop reads as a collision + overspeed
+            # spawn just above the asphalt: a higher drop reads as a collision + overspeed (3D velocity) at the start
             transform.location.z = self.map.get_waypoint(transform.location).transform.location.z + 0.5
             self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
             for attempt in range(100):  # background traffic may be passing over the spawn point: let it clear
@@ -559,7 +559,7 @@ class CarlaEnvironment():
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
 
 
-    # A random spawn point from which the road goes on for at least `metres` (dead ends at the edge of OSM extracts)
+    # A random spawn point from which the road goes on for at least `metres`
     def long_route_spawn(self, metres, tries=30):
         points = self.map.get_spawn_points()
         for _ in range(tries):
