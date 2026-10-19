@@ -1,0 +1,110 @@
+{
+ "name": "bc_share",
+ "args": {
+  "town": "Town02",
+  "vn": true,
+  "no_share": false,
+  "model": "data/bc_policy_Town02.pth",
+  "expert": false,
+  "episodes": 6,
+  "steps": 2000,
+  "seed": 0,
+  "name": "bc_share"
+ },
+ "summary": {
+  "episodes": 6,
+  "km": 0.225,
+  "route_done_%": 0.0,
+  "progress_%": 4.7,
+  "collisions_per_km": 13.33,
+  "near_miss_s_per_km": 1.6,
+  "red_light_runs_per_km": 17.78,
+  "mean_speed_kmh": 4.5,
+  "mean_abs_dsteer": 0.049,
+  "ends": {
+   "collision": 3,
+   "max_steps": 1,
+   "overspeed": 2
+  }
+ },
+ "episodes": [
+  {
+   "episode": 0,
+   "end": "collision",
+   "steps": 678,
+   "km": 0.023911253720583933,
+   "progress": 0.029487179487179487,
+   "route_done": false,
+   "collisions": 1,
+   "near_miss_steps": 0,
+   "red_runs": 0,
+   "mean_speed": 2.5392481827168765,
+   "jerk": 0.022463032496223573
+  },
+  {
+   "episode": 1,
+   "end": "collision",
+   "steps": 1602,
+   "km": 0.13243665658658133,
+   "progress": 0.16538461538461538,
+   "route_done": false,
+   "collisions": 1,
+   "near_miss_steps": 0,
+   "red_runs": 3,
+   "mean_speed": 5.952209284790181,
+   "jerk": 0.0578046803050628
+  },
+  {
+   "episode": 2,
+   "end": "collision",
+   "steps": 853,
+   "km": 0.026354924116390715,
+   "progress": 0.03333333333333333,
+   "route_done": false,
+   "collisions": 1,
+   "near_miss_steps": 0,
+   "red_runs": 0,
+   "mean_speed": 2.2245656932944105,
+   "jerk": 0.05153563761169796
+  },
+  {
+   "episode": 3,
+   "end": "overspeed",
+   "steps": 89,
+   "km": 0.013068590630561294,
+   "progress": 0.016666666666666666,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 0,
+   "red_runs": 1,
+   "mean_speed": 10.572342982027118,
+   "jerk": 0.05921186203806755
+  },
+  {
+   "episode": 4,
+   "end": "overspeed",
+   "steps": 58,
+   "km": 0.0039001980391174984,
+   "progress": 0.005128205128205128,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 0,
+   "red_runs": 0,
+   "mean_speed": 4.841625152007928,
+   "jerk": 0.05409201697028916
+  },
+  {
+   "episode": 5,
+   "end": "max_steps",
+   "steps": 2000,
+   "km": 0.025304938604989245,
+   "progress": 0.03205128205128205,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 7,
+   "red_runs": 0,
+   "mean_speed": 0.9109777897796161,
+   "jerk": 0.0504477612626506
+  }
+ ]
+}

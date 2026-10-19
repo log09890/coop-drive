@@ -151,6 +151,8 @@ def runner():
             while timestep < total_timesteps:
             
                 observation = env.reset()
+                if observation is None:  # reset failed (e.g. no free spawn point in dense traffic): try again
+                    continue
                 observation = encode.process(observation)
 
                 current_ep_reward = 0
@@ -245,6 +247,8 @@ def runner():
             #Testing
             while timestep < args.test_timesteps:
                 observation = env.reset()
+                if observation is None:  # reset failed (e.g. no free spawn point in dense traffic): try again
+                    continue
                 observation = encode.process(observation)
 
                 current_ep_reward = 0

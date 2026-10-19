@@ -84,18 +84,22 @@ class CarlaEnvironment():
             elif self.town == "Town02":
                 transform = self.map.get_spawn_points()[1] #Town2 is 1
                 self.total_distance = 780
-                if self.traffic and self.fresh_start:  # VN mode: a new random route every time
+                if self.traffic:  # VN mode (always a fresh start): a new random route every time
                     transform = random.choice(self.map.get_spawn_points())
             else:
                 transform = random.choice(self.map.get_spawn_points())
                 self.total_distance = 250
 
             self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
-            for _ in range(100):  # background traffic may be passing over the spawn point: let it clear
+            for attempt in range(100):  # background traffic may be passing over the spawn point: let it clear
                 if self.vehicle is not None or not COOP_SECTORS:
                     break
                 self.world.tick()
+                if self.traffic and attempt % 10 == 9:  # VN mode: that spot stays busy, try another one
+                    transform = random.choice(self.map.get_spawn_points())
                 self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
+            if self.vehicle is None:
+                raise RuntimeError('could not spawn the ego vehicle')  # never put None in actor_list: DestroyActor(None) segfaults
             self.actor_list.append(self.vehicle)
 
 
@@ -134,6 +138,8 @@ class CarlaEnvironment():
             self.distance_covered = 0.0
 
 
+            if self.checkpoint_frequency is None or self.traffic:
+                self.fresh_start = True  # no checkpoints (eval, BC data, dense VN traffic): never teleport into traffic
             if self.fresh_start:
                 self.current_waypoint_index = 0
                 # Waypoint nearby angle and distance from it
@@ -165,6 +171,7 @@ class CarlaEnvironment():
                 # Teleport vehicle to last checkpoint
                 waypoint = self.route_waypoints[self.checkpoint_waypoint_index % len(self.route_waypoints)]
                 transform = waypoint.transform
+                transform.location.z += 0.3  # a waypoint sits on the asphalt: teleporting there makes the car pop up
                 self.vehicle.set_transform(transform)
                 self.current_waypoint_index = self.checkpoint_waypoint_index
 
