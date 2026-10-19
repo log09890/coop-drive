@@ -55,6 +55,7 @@ class VNTraffic:
         self.swarm = {}  # vehicle id -> (light id, cells) for vehicles packed in front of a red light
         self.ticks = self.rescued = 0
         self.stall = {}  # vehicle id -> ticks standing still without a reason
+        self.crossers = []  # (walker, tick to remove) on maps without a walker navigation mesh (OSM imports)
         self.chaos = 5.0  # mean seconds between random surprise events near the ego, 0 = off
         self.next_event = int(self.chaos / DT)
         self.log = []  # event names for the dashboard
@@ -125,7 +126,7 @@ class VNTraffic:
                 a.is_at_traffic_light() and a.get_traffic_light_state() != carla.TrafficLightState.Green)
             self.stall[a.id] = self.stall.get(a.id, 0) + 10 if (vel.x ** 2 + vel.y ** 2) < 0.25 and not waiting else 0
             stuck = self.stall[a.id] > 400  # 20 s still for no reason (TM dead end, wedged between bikes)
-            if not stuck and abs(t.rotation.pitch) < 35 and abs(t.rotation.roll) < 35 and t.location.z - wp.transform.location.z < 1.5:
+            if not stuck and abs(t.rotation.pitch) < 35 and abs(t.rotation.roll) < 35 and -1.0 < t.location.z - wp.transform.location.z < 1.5:
                 continue
             self.stall[a.id] = 0
             for tr in self.rng.sample(far, min(20, len(far))):
@@ -136,9 +137,37 @@ class VNTraffic:
                     self.rescued += 1
                     break
 
+    def _crossers(self, env):
+        """No navigation mesh (generated OpenDRIVE worlds): pedestrians still cross anywhere, scripted directly."""
+        alive = []
+        for w, until in self.crossers:
+            if self.ticks < until:
+                alive.append((w, until))
+            elif w.is_alive:
+                w.destroy()  # walkers are not TM vehicles: destroying one is safe
+        self.crossers = alive
+        if len(self.crossers) >= 12:
+            return
+        near = self._near_ego_slots(env, 15, 45)
+        if not near:
+            return
+        tr = self.rng.choice(near)
+        r = tr.get_right_vector()
+        side = self.rng.choice((-1, 1))
+        edge = self.map.get_waypoint(tr.location).lane_width / 2 + 0.4
+        start = tr.location + carla.Location(x=r.x * side * edge, y=r.y * side * edge, z=1.0)
+        w = self.world.try_spawn_actor(self.rng.choice(self.world.get_blueprint_library().filter('walker.pedestrian.*')),
+                                       carla.Transform(start))
+        if w:
+            w.apply_control(carla.WalkerControl(direction=carla.Vector3D(-r.x * side, -r.y * side, 0), speed=self.rng.uniform(1.2, 2.0)))
+            self.crossers.append((w, self.ticks + 400))  # ~20 s: across the road and gone
+
     def update(self, env):
         '''Call once per world tick: motorbikes swerve between lanes, and every `chaos` s a surprise near the ego.'''
         self.ticks += 1
+        if True:  # every tick: drop actors Unreal destroyed (fell off a generated map's road into the void)
+            self.vehicles = [v for v in self.vehicles if v.is_alive]
+            self.motorbikes = [v for v in self.motorbikes if v.is_alive]
         if self.chaos and self.ticks >= self.next_event:
             self.next_event = self.ticks + int(self.chaos * self.rng.uniform(0.5, 1.5) / DT)  # irregular: harder to anticipate
             name = self.rng.choice(list(EVENTS))
@@ -148,6 +177,8 @@ class VNTraffic:
             self._recycle(env)
         if self.ticks % 10 == 5:
             self._rescue(env)
+        if not self.walkers and self.ticks % 40 == 0:
+            self._crossers(env)
         if self.ticks % 5 == 0:
             self._swarm(env)
         if self.ticks % 40 == 0 and self.motorbikes:
@@ -203,7 +234,8 @@ class VNTraffic:
     def destroy(self):
         for c in self.controllers:
             c.stop()
-        self.client.apply_batch_sync([carla.command.DestroyActor(a) for a in self.controllers + self.walkers + self.vehicles], True)
+        self.client.apply_batch_sync([carla.command.DestroyActor(a) for a in self.controllers + self.walkers + self.vehicles
+                                      + [w for w, _ in self.crossers]], True)
         self.vehicles, self.motorbikes, self.walkers, self.controllers = [], [], [], []
 
 

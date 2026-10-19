@@ -1,9 +1,12 @@
 @echo off
-rem Double-click: starts CARLA if needed, waits for it, opens the Coop-Drive dashboard. Extra args go to dashboard.py (e.g. --expert).
+rem Double-click: starts CARLA if needed, waits for it, opens the Coop-Drive dashboard. Extra args go to dashboard.py (e.g. --town NgaTuSo --vn).
+rem If the server dies (the 0.9.10 OpenDRIVE generator sometimes takes it down), it is restarted and the dashboard retried, 3 times.
 chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 cd /d "%~dp0"
+set TRIES=0
 
+:start
 tasklist /FI "IMAGENAME eq CarlaUE4-Win64-Shipping.exe" | "%SystemRoot%\System32\find.exe" /I "CarlaUE4" >nul
 if errorlevel 1 (
     echo Dang bat CARLA server...
@@ -19,4 +22,13 @@ if errorlevel 1 (
 )
 
 venv\Scripts\python.exe dashboard.py %*
-if errorlevel 1 pause
+if not errorlevel 1 goto :eof
+
+set /a TRIES+=1
+tasklist /FI "IMAGENAME eq CarlaUE4-Win64-Shipping.exe" | "%SystemRoot%\System32\find.exe" /I "CarlaUE4" >nul
+if errorlevel 1 if %TRIES% LSS 3 (
+    echo CARLA server da tat, khoi dong lai ^(lan %TRIES%/3^)...
+    timeout /t 5 /nobreak >nul
+    goto start
+)
+pause

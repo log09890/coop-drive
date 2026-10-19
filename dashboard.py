@@ -279,6 +279,11 @@ class Dashboard:
 
     # ------------------------------------------------------------------ drawing
     def draw(self, env, obs, action, reward):
+        if env.timesteps % 5 == 0:  # keep the CARLA server window on the ego (generated maps are black away from the roads)
+            t = env.vehicle.get_transform()
+            f = t.get_forward_vector()
+            env.world.get_spectator().set_transform(carla.Transform(
+                t.location + carla.Location(x=-12 * f.x, y=-12 * f.y, z=8), carla.Rotation(pitch=-25, yaw=t.rotation.yaw)))
         s = self.screen
         s.fill(BG)
         chaos = 'off' if not env.traffic else ('off' if not env.traffic.chaos else f'{env.traffic.chaos:.0f}s')
@@ -369,7 +374,9 @@ class Dashboard:
             return mx + rgt * scale, my - f * scale
 
         s.set_clip(pygame.Rect(x - 4, y, 312, 180))
-        pygame.draw.lines(s, (70, 70, 90), False, [to_map(w.transform.location) for w in env.route_waypoints[::4]], 3)
+        route = [to_map(w.transform.location) for w in env.route_waypoints[::4]]
+        if len(route) > 1:
+            pygame.draw.lines(s, (70, 70, 90), False, route, 3)
         riders = {r.v.id for r in env.riders if r.v}
         for a in env.world.get_actors().filter('vehicle.*'):
             if a.id != env.vehicle.id:

@@ -87,9 +87,11 @@ class CarlaEnvironment():
                 if self.traffic:  # VN mode (always a fresh start): a new random route every time
                     transform = random.choice(self.map.get_spawn_points())
             else:
-                transform = random.choice(self.map.get_spawn_points())
                 self.total_distance = 250
+                transform = self.long_route_spawn(150)  # OSM maps: many spawn points sit right before a dead end
 
+            # generated (OSM) maps put spawn points ~1.5 m above the asphalt: the drop reads as a collision + overspeed
+            transform.location.z = self.map.get_waypoint(transform.location).transform.location.z + 0.5
             self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
             for attempt in range(100):  # background traffic may be passing over the spawn point: let it clear
                 if self.vehicle is not None or not COOP_SECTORS:
@@ -97,6 +99,7 @@ class CarlaEnvironment():
                 self.world.tick()
                 if self.traffic and attempt % 10 == 9:  # VN mode: that spot stays busy, try another one
                     transform = random.choice(self.map.get_spawn_points())
+                    transform.location.z = self.map.get_waypoint(transform.location).transform.location.z + 0.5
                 self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
             if self.vehicle is None:
                 raise RuntimeError('could not spawn the ego vehicle')  # never put None in actor_list: DestroyActor(None) segfaults
@@ -554,6 +557,22 @@ class CarlaEnvironment():
         # Main vehicle spawned into the env
         spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+
+
+    # A random spawn point from which the road goes on for at least `metres` (dead ends at the edge of OSM extracts)
+    def long_route_spawn(self, metres, tries=30):
+        points = self.map.get_spawn_points()
+        for _ in range(tries):
+            sp = random.choice(points)
+            wp, n = self.map.get_waypoint(sp.location), 0
+            while n < metres:
+                nxt = wp.next(1.0)
+                if not nxt:
+                    break
+                wp, n = random.choice(nxt), n + 1
+            if n >= metres:
+                return sp
+        return random.choice(points)
 
 
     # Seconds for the episode rules: simulated time in sync mode (the sim may run slower than real time)
