@@ -1,5 +1,21 @@
 # Coop-Drive: PPO + VAE (idreesshaikh) + cooperative LiDAR (CODD)
 
+## Bắt đầu nhanh
+
+Bấm đúp **`CoopDrive.bat`** (hoặc biểu tượng **Coop-Drive** trên Desktop, tự tạo ở lần chạy đầu). Lần đầu nó tạo `venv` (Python 3.7, cần mạng một lần),
+sau đó tự bật CARLA (đường dẫn hỏi một lần, lưu vào `coopdrive.json`) và mở dashboard. Mọi thứ còn lại gõ trong terminal của dashboard:
+
+| lệnh | việc |
+|-|-|
+| `help` | danh sách lệnh |
+| `set` · `set <key> <value>` | xem / đổi mọi cài đặt (town, vn, infra, share, driver, model, collect_steps, total_timesteps, eval_*, fps, fullscreen, carla_root…), tự lưu; dấu `*` = áp dụng sau `restart` |
+| `mode drive\|collect\|train\|eval\|bc` | chuyển chế độ (dashboard tự mở lại) |
+| `pipeline start\|status\|resume\|retry\|skip\|stop` | chuỗi collect → BC → đánh giá → fine-tune PPO → đánh giá; hàng đợi lưu trong `coopdrive.json`, tắt máy bật lại vẫn chạy tiếp (collect nối tiếp dữ liệu cũ, train tiếp từ checkpoint) |
+| `results` | bảng kết quả `results/*.json` |
+| `restart` · `server restart` | mở lại dashboard · bật lại cả CARLA |
+
+`app.py` là launcher: dashboard lỗi thì tự mở lại (3 lần, CARLA chết thì bật lại), mỗi lần một cổng Traffic Manager mới.
+
 Xe ego vẫn lái bằng PPO trên latent VAE của camera semantic như repo gốc. Thêm vào:
 mỗi episode spawn `COOP_VEHICLES` xe autopilot quanh ego, mỗi xe (và ego) gắn LiDAR theo
 cấu hình CODD và "chia sẻ" scan + pose. Các scan được hợp nhất về khung toạ độ ego rồi nén

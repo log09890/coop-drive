@@ -14,7 +14,9 @@ import math
 import os
 import pickle
 import random
+import subprocess
 import sys
+import threading
 import time
 import weakref
 import numpy as np
@@ -25,14 +27,18 @@ from simulation.environment import CarlaEnvironment
 from simulation.coop import pose_matrix, to_ego
 from simulation.scenarios import spawn_scenario
 from simulation.vn_traffic import MOTORBIKES, BICYCLES, EVENTS
-from simulation.settings import COOP_SECTORS, COOP_CORRIDOR, COOP_VEHICLES, COOP_OBS, LIDAR_CHANNELS, LIDAR_POINTS_PER_SECOND
+from simulation.settings import TM_PORT, COOP_SECTORS, COOP_CORRIDOR, COOP_VEHICLES, COOP_OBS, LIDAR_CHANNELS, LIDAR_POINTS_PER_SECOND
 from encoder_init import EncodeState
 from autoencoder.decoder import Decoder
 from networks.on_policy.ppo.agent import PPOAgent
-from parameters import LATENT_DIM, PPO_CHECKPOINT_DIR
+from parameters import LATENT_DIM
 from bc import expert_action
 from insight import closest_approach, input_sensitivity, group_sensitivity, SessionMetrics
 from term import Terminal, nice_ticks
+import appcfg
+import evaluate
+
+RESTART, SERVER_RESTART = 75, 76  # exit codes the launcher (app.py) acts on
 
 W, H, HEAD, TABS, BOTTOM = 1600, 900, 30, 24, 236  # canvas; the window is scaled to fit the screen
 TOP = HEAD + TABS
@@ -48,11 +54,11 @@ SERIES = 600  # 30 s of samples at 20 Hz
 
 # camera rigs on the ego: size, mount, fov, sensor_tick (0: every frame)
 CAMS = {'chase': (BIG, carla.Transform(carla.Location(x=-6.0, z=3.0), carla.Rotation(pitch=-15.0)), 90, 0.0),
-        'hood': ((640, 360), carla.Transform(carla.Location(x=1.6, z=1.45), carla.Rotation(pitch=-4.0)), 90, 0.2),
-        'rear': ((480, 270), carla.Transform(carla.Location(x=-2.4, z=1.2), carla.Rotation(yaw=180.0)), 90, 0.2),
-        'mirror_l': ((480, 270), carla.Transform(carla.Location(x=0.6, y=-1.1, z=1.1), carla.Rotation(yaw=-160.0)), 60, 0.2),
-        'mirror_r': ((480, 270), carla.Transform(carla.Location(x=0.6, y=1.1, z=1.1), carla.Rotation(yaw=160.0)), 60, 0.2),
-        'bev': (BEV, carla.Transform(carla.Location(z=40.0), carla.Rotation(pitch=-90.0)), 70, 0.1)}
+        'hood': ((640, 360), carla.Transform(carla.Location(x=1.6, z=1.45), carla.Rotation(pitch=-4.0)), 90, 0.0),
+        'rear': ((480, 270), carla.Transform(carla.Location(x=-2.4, z=1.2), carla.Rotation(yaw=180.0)), 90, 0.0),
+        'mirror_l': ((480, 270), carla.Transform(carla.Location(x=0.6, y=-1.1, z=1.1), carla.Rotation(yaw=-160.0)), 60, 0.0),
+        'mirror_r': ((480, 270), carla.Transform(carla.Location(x=0.6, y=1.1, z=1.1), carla.Rotation(yaw=160.0)), 60, 0.0),
+        'bev': (BEV, carla.Transform(carla.Location(z=40.0), carla.Rotation(pitch=-90.0)), 70, 0.0)}
 META = {  # panel: (tag, title)
     'chase': ('CAM-01', 'CHASE · 3RD PERSON'), 'hood': ('CAM-02', 'FRONT · HOOD'), 'rear': ('CAM-03', 'REAR VIEW'),
     'mirror_l': ('CAM-04', 'MIRROR · LEFT'), 'mirror_r': ('CAM-05', 'MIRROR · RIGHT'), 'bev': ('CAM-06', 'BEV · TRAFFIC OVERLAY'),
@@ -82,6 +88,11 @@ PAGES = {  # name: [(panel, (x, y, w, h))], page area y 56..660
 PAGE_AREA = (0, 56, W, 604)
 STRIP = [('terminal', (0, H - BOTTOM, 1100, BOTTOM)), ('system', (1104, H - BOTTOM, 496, BOTTOM))]
 HELP = [
+    ('set [key value]', 'list or change settings (saved; * = applied after restart)'),
+    ('mode <m>', 'drive · collect · train · eval · bc   (restarts into that mode)'),
+    ('pipeline <cmd>', 'start · status · resume · retry · skip · stop   (collect→BC→eval→PPO→eval)'),
+    ('results', 'table of results/*.json'),
+    ('restart | server restart', 'reload the dashboard · restart the CARLA server too'),
     ('page <name|1-5>', 'overview cameras sensors charts policy   (or F1-F5)'),
     ('focus <panel>|off', 'one panel over the whole page'),
     ('spawn <event>', 'ped slow parked ' + ' '.join(EVENTS)),
@@ -100,8 +111,10 @@ HELP = [
 ]
 COMPLETE = {'spawn': sorted(SCENARIOS) + sorted(EVENTS), 'weather': sorted(WEATHER), 'driver': ['expert', 'ppo'],
             'focus': sorted(META) + ['off'], 'chaos': ['on', 'off'], 'fullscreen': ['on', 'off'], 'page': list(PAGES),
-            'v2x': ['latency', 'loss', 'range', 'gps', 'cars', 'bikes', 'on', 'off']}
-COMMANDS = ['help', 'page', 'focus', 'spawn', 'chaos', 'density', 'driver', 'weather', 'v2x', 'pause', 'reset', 'replay',
+            'v2x': ['latency', 'loss', 'range', 'gps', 'cars', 'bikes', 'on', 'off'],
+            'set': [k for k in appcfg.DEFAULTS if k not in ('job', 'queue')], 'mode': list(appcfg.MODES),
+            'pipeline': ['start', 'status', 'resume', 'retry', 'skip', 'stop'], 'server': ['restart']}
+COMMANDS = ['help', 'set', 'mode', 'pipeline', 'results', 'restart', 'server', 'page', 'focus', 'spawn', 'chaos', 'density', 'driver', 'weather', 'v2x', 'pause', 'reset', 'replay',
             'gif', 'fullscreen', 'snapshot', 'stats', 'history', 'log', 'cls', 'clear', 'quit']
 
 
@@ -254,7 +267,7 @@ class Tee:
 
 
 class Dashboard:
-    def __init__(self, agent, policy_ok, mode, config):
+    def __init__(self, agent, policy_ok, mode, config, cfg, app):
         try:  # without this Windows magnifies the window by the display scale (200 %) and it no longer fits
             import ctypes
             ctypes.windll.user32.SetProcessDPIAware()
@@ -266,6 +279,10 @@ class Dashboard:
         k = min(1.0, info.current_w * 0.96 / W, (info.current_h - 100) * 0.96 / H)
         self.windowed, self.fullscreen = (int(W * k), int(H * k)), False
         self.window = pygame.display.set_mode(self.windowed, pygame.RESIZABLE)
+        try:
+            pygame.display.set_icon(pygame.image.load(os.path.join('assets', 'coopdrive.png')))
+        except Exception:
+            pass
         self.screen = pygame.Surface((W, H))  # everything is drawn here at a fixed size
         self.run_id = time.strftime('%Y%m%d-%H%M%S')
         pygame.display.set_caption(f'Coop-Drive research console · run {self.run_id}')
@@ -275,6 +292,8 @@ class Dashboard:
         self.bold = pygame.font.SysFont(f, 13, bold=True)
         self.large = pygame.font.SysFont(f, 22, bold=True)
         self.agent, self.policy_ok, self.mode, self.config = agent, policy_ok, mode, config
+        self.cfg, self.app, self.exit_code, self.pending, self.cache = cfg, app, 0, [], {}
+        self.status = ''  # job progress line for the run-control panel
         self.decoder = Decoder(LATENT_DIM).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         self.decoder.load()
         self.decoder.eval()
@@ -282,18 +301,19 @@ class Dashboard:
         self.cams, self.rsu_cam, self.rsu_j, self.collision = {}, None, None, None
         self.episode, self.ep_reward, self.ep_hist = 0, 0.0, []  # ep_hist: returns of finished episodes
         self.driver = 'ppo' if policy_ok and mode != 'collect' else 'expert'
-        self.line, self.hist_i, self.page, self.focus = '', 0, 'overview', None
+        self.line, self.hist_i, self.page, self.focus = '', 0, cfg['page'] if cfg['page'] in PAGES else 'overview', None
+        self.need_capture = False
         self.paused = self.quit = self.want_reset = False
         self.metrics, self.timeline, self.sim_t = SessionMetrics(), [], 0.0  # timeline: (sim time s, kind, label)
         self.frames = collections.deque(maxlen=120)  # ~10+ s of half-size window frames for the instant replay
         self.replay, self.replay_i = None, 0
-        self.hits, self.series = [], collections.defaultdict(lambda: collections.deque(maxlen=SERIES))
+        self.hits, self.hit_ids, self.series = [], [], collections.defaultdict(lambda: collections.deque(maxlen=SERIES))
         self.ms = collections.defaultdict(float)  # latest timings: step, vae, policy, draw
         self.mean, self.value, self.sens, self.sens_step = np.zeros(2), 0.0, None, -1
         self.worst, self.prev_speed, self.accel, self.yaw_rate, self.prev_yaw = None, 0.0, 0.0, 0.0, None
         self.train = {'timestep': 0, 'target': 0, 'episode': 0, 'avg': 0.0, 'updates': 0, 'update_s': 0.0, 'saves': 0,
                       'start': time.time(), 'steps0': 0, 'std': getattr(agent, 'action_std', 0.0), 'note': ''}
-        self.fps, self.last_frame = 0.0, time.time()
+        self.fps, self.last_frame, self.last_input, self.step_wall, self.prev_step_t = 0.0, time.time(), 0.0, 0.05, time.time()
         self.log(f'run {self.run_id} · mode {mode} · {config}', 'INFO')
         self.log(f'session log → {self.term.path}', 'INFO')
 
@@ -309,7 +329,8 @@ class Dashboard:
         bp = env.world.get_blueprint_library().find('sensor.other.collision')
         self.collision = env.world.spawn_actor(bp, carla.Transform(), attach_to=env.vehicle)
         self.hits = []
-        self.collision.listen(lambda e: self.hits.append(e.other_actor.type_id))  # read on the main thread in after_step
+        self.hits, self.hit_ids = [], []
+        self.collision.listen(lambda e: (self.hits.append(e.other_actor.type_id), self.hit_ids.append(e.other_actor.id)))
         env.sensor_list += [c.sensor for c in self.cams.values()] + [self.collision]
         self.episode += 1
         self.ep_reward = 0.0
@@ -323,6 +344,9 @@ class Dashboard:
     def after_step(self, env, o, reward):
         '''Per simulation step: telemetry series, policy outputs, session metrics, timeline events and collisions.'''
         self.sim_t += 0.05
+        self.need_capture = True
+        now = time.time()
+        self.step_wall, self.prev_step_t = 0.8 * self.step_wall + 0.2 * (now - self.prev_step_t), now
         with torch.no_grad():
             x = o.cpu().unsqueeze(0)
             self.mean = self.agent.old_policy.actor(x)[0].numpy()
@@ -378,7 +402,7 @@ class Dashboard:
             self.rsu_cam.sensor.destroy()
         yaw = math.degrees(math.atan2(e.y - near['xy'][1], e.x - near['xy'][0]))
         tr = carla.Transform(carla.Location(near['xy'][0], near['xy'][1], near['ground'] + 7.0), carla.Rotation(pitch=-28.0, yaw=yaw))
-        self.rsu_cam, self.rsu_j = ChaseCamera(None, (640, 360), tr, 90, 0.1, env.world), near['junction']
+        self.rsu_cam, self.rsu_j = ChaseCamera(None, (640, 360), tr, 90, 0.0, env.world), near['junction']
         env.sensor_list.append(self.rsu_cam.sensor)
         self.log(f"RSU camera → junction {near['junction']}", 'SYS')
 
@@ -421,18 +445,145 @@ class Dashboard:
         imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=100, loop=0)
         self.log(f'saved {path}', 'OUT')
 
+    # ------------------------------------------------------------------ app: settings, jobs, restarts
+    def cached(self, key, env, fn):
+        '''fn() once per simulation step: the UI redraws several times per step and must not redo the heavy parts.'''
+        k = (key, env.timesteps)
+        if k not in self.cache:
+            self.cache = {kk: v for kk, v in self.cache.items() if kk[1] == env.timesteps}
+            self.cache[k] = fn()
+        return self.cache[k]
+
+    def run_pending(self, env):
+        while self.pending:
+            self.run(env, self.pending.pop(0))
+
+    def save_cfg(self):
+        if self.app:
+            appcfg.save(self.cfg)
+
+    def restart(self, why, code=RESTART):
+        if not self.app:
+            return self.log('restart needs the app (CoopDrive.bat); this session was started with command-line flags', 'WARN')
+        self.save_cfg()
+        self.log(f'{why} · restarting…', 'INFO')
+        self.exit_code, self.quit = code, True
+
+    def finish_job(self, summary=''):
+        '''The current mode finished its work: next queued job, or back to drive.'''
+        self.log(f'job {self.mode} complete' + (f' · {summary}' if summary else ''), 'INFO')
+        if not self.app:
+            self.quit = True
+            return
+        nxt = appcfg.next_job(self.cfg)
+        self.restart(f'next: {nxt}' + (f" ({len(self.cfg['queue'])} queued)" if self.cfg['queue'] else ''))
+
+    def fail_job(self, why):
+        self.log(f'job {self.mode} failed: {why}', 'ERR')
+        self.log('pipeline retry · pipeline skip · pipeline stop · mode drive', 'WARN')
+        self.status = 'FAILED · ' + why
+
+    def cmd_set(self, args):
+        cfg = self.cfg
+        if not args:
+            for k in appcfg.DEFAULTS:
+                if k not in ('job', 'queue'):
+                    self.log(f"  {k:16} {str(cfg[k]):34} {'' if k in appcfg.LIVE else '*'} {appcfg.HELP.get(k, '')}", 'OUT')
+            return self.log(f"  file {appcfg.PATH if self.app else '(command-line session: not saved)'}", 'OUT')
+        try:
+            val = appcfg.coerce(args[0], ' '.join(args[1:])) if len(args) > 1 else None
+            cur = cfg[args[0]] if args[0] not in ('job', 'queue') else None
+        except KeyError:
+            return self.log(f'no setting {args[0]} · set lists them', 'WARN')
+        except ValueError as e:
+            return self.log(str(e) or f'bad value for {args[0]}', 'WARN')
+        key = args[0]
+        if val is None:
+            return self.log(f'{key} = {cur}   {appcfg.HELP.get(key, "")}', 'OUT')
+        if key == 'mode':
+            return self.cmd_mode([val])
+        if key == 'driver' and val == 'ppo' and not self.policy_ok:
+            return self.log('no matching PPO model', 'WARN')
+        cfg[key] = val
+        self.save_cfg()
+        if key == 'fullscreen':
+            self.set_fullscreen(val)
+        elif key == 'page':
+            self.page = val if val in PAGES else self.page
+        elif key == 'driver' and self.mode == 'drive':
+            self.driver = 'ppo' if val == 'ppo' or (val == 'auto' and self.policy_ok) else 'expert'
+        self.log(f'{key} = {val}' + ('' if key in appcfg.LIVE else '  · type restart to apply'), 'OUT')
+
+    def cmd_mode(self, args):
+        if not args or args[0] not in appcfg.MODES:
+            return self.log(f'mode {self.mode} · modes: {" ".join(appcfg.MODES)}', 'OUT')
+        self.cfg['job'], self.cfg['mode'] = {'mode': args[0]}, args[0]  # a manual job: the pipeline queue waits
+        self.restart(f'mode {args[0]}')
+
+    def cmd_pipeline(self, args):
+        cfg, a = self.cfg, args[0] if args else 'status'
+        if a == 'start':
+            cfg['queue'] = appcfg.pipeline(cfg['town'])
+            appcfg.start_job(cfg, cfg['queue'][0])
+            return self.restart(f"pipeline of {len(cfg['queue'])} jobs")
+        if a == 'resume':
+            if not cfg['queue']:
+                return self.log('nothing queued · pipeline start', 'WARN')
+            appcfg.start_job(cfg, cfg['queue'][0])
+            return self.restart('pipeline resumed')
+        if a == 'retry':
+            return self.restart(f'retry {self.mode}')
+        if a == 'skip':
+            return self.restart(f'skipped {self.mode} · next {appcfg.next_job(cfg)}')
+        if a == 'stop':
+            cfg['queue'], cfg['job'], cfg['mode'] = [], {}, 'drive'
+            return self.restart('pipeline stopped')
+        if not cfg['queue']:
+            return self.log('pipeline idle · pipeline start runs collect → BC → eval → PPO fine-tune → eval', 'OUT')
+        for k, j in enumerate(cfg['queue']):
+            what = ' '.join(f'{x}={v}' for x, v in j.items() if x not in ('mode', 'vn', 'infra'))
+            self.log(f"  {'▶' if k == 0 and j == cfg['job'] else ' '} {k + 1}. {j['mode']:8} {what}", 'OUT')
+
+    def cmd_results(self):
+        import glob
+        import json
+        rows = []
+        for f in sorted(glob.glob('results/*.json')):
+            try:
+                d = json.load(open(f))
+            except ValueError:
+                continue
+            m = d.get('summary', {})
+            if 'collisions_per_km' in m:
+                rows.append(f"  {d.get('name', f):22} {m['km']:6.2f} km  coll/km {m['collisions_per_km']:6.2f}  near-miss s/km "
+                            f"{m['near_miss_s_per_km']:6.1f}  red/km {m['red_light_runs_per_km']:5.2f}  route {m['route_done_%']:5.1f}%  "
+                            f"{m['mean_speed_kmh']:5.1f} km/h")
+        for r in rows or ['  no results yet']:
+            self.log(r, 'OUT')
+
     # ------------------------------------------------------------------ commands
     def run(self, env, line):
         parts = line.strip().lstrip('/').split()
         if not parts:
             return
-        self.term.command(line.strip(), self.sim_t)
         cmd, args = parts[0].lower(), parts[1:]
         out = lambda text, level='OUT': self.log(text, level)
         if cmd == 'help':
             for c, d in HELP:
-                out(f'  {c:24} {d}')
+                out(f'  {c:26} {d}')
             return
+        if cmd == 'set':
+            return self.cmd_set(args)
+        if cmd == 'mode':
+            return self.cmd_mode(args)
+        if cmd == 'pipeline':
+            return self.cmd_pipeline(args)
+        if cmd == 'results':
+            return self.cmd_results()
+        if cmd == 'restart':
+            return self.restart('restart')
+        if cmd == 'server':
+            return self.restart('CARLA server restart', SERVER_RESTART) if args[:1] == ['restart'] else out('server restart', 'WARN')
         if cmd == 'page':
             names = list(PAGES)
             a = args[0].lower() if args else ''
@@ -472,6 +623,8 @@ class Dashboard:
         if cmd == 'driver' and args and args[0] in ('expert', 'ppo'):
             if self.mode != 'drive':
                 return out(f'driver is locked while in {self.mode} mode', 'WARN')
+            self.cfg['driver'] = args[0]
+            self.save_cfg()
             if args[0] == 'ppo' and not self.policy_ok:
                 return out('no matching PPO model', 'WARN')
             self.driver = args[0]
@@ -548,8 +701,12 @@ class Dashboard:
         return slash + ' '.join(parts[:-1] + [os.path.commonprefix(hits) + (' ' if len(hits) == 1 else '')])
 
     def handle_events(self, env):
+        '''Keyboard / mouse / window events; True if there were any (the UI then redraws at full fps).'''
         rows = self.term_rows()
-        for e in pygame.event.get():
+        events = pygame.event.get()
+        if any(e.type in (pygame.KEYDOWN, pygame.TEXTINPUT, pygame.MOUSEWHEEL) for e in events):
+            self.last_input = time.time()
+        for e in events:
             if e.type == pygame.QUIT:
                 self.quit = True
             elif e.type == pygame.VIDEORESIZE and not self.fullscreen:
@@ -565,7 +722,9 @@ class Dashboard:
                 elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     line, self.line = self.line, ''
                     self.term.scroll = 0
-                    self.run(env, line)
+                    if line.strip():
+                        self.term.command(line.strip(), self.sim_t)
+                        self.pending.append(line)  # run between simulation steps (the sim may be mid-tick)
                     self.hist_i = len(self.term.history)
                 elif e.key == pygame.K_ESCAPE:
                     self.line, self.replay = '', None
@@ -581,13 +740,14 @@ class Dashboard:
                     self.line = self.complete(self.line)
                 elif e.key == pygame.K_BACKSPACE:
                     self.line = self.line[:-1]
-                elif e.unicode and e.unicode.isprintable():
-                    self.line += e.unicode
+            elif e.type == pygame.TEXTINPUT:  # text after the keyboard layout / IME, one event per character typed
+                self.line += e.text
         if env.traffic and env.traffic.log:  # surprise events fired by the chaos timer
             for name in env.traffic.log:
                 self.log(f'chaos event: {name}', 'EVT')
                 self.mark('chaos', name)
             env.traffic.log.clear()
+        return bool(events)
 
     # ------------------------------------------------------------------ drawing helpers
     def text(self, s, msg, pos, color=FG, font=None, right=False):
@@ -712,7 +872,7 @@ class Dashboard:
                  for wp in env.route_waypoints[env.current_waypoint_index::2][:40]]
         if len(route) > 1:
             pygame.draw.lines(s, (120, 120, 170), False, route, 2)
-        near = conflicts(env)
+        near = self.cached('conflicts', env, lambda: conflicts(env))
         for a, p, va, vr, ttc, dist in near:
             danger = dist < 2.5 and 0 < ttc < 3
             u = (mx + p[1] * scale, my - p[0] * scale)
@@ -746,7 +906,8 @@ class Dashboard:
         n_cars = len(scans)
         if env.infra:
             scans += [r['lidar'].latest for r in env.infra.rsus if r['lidar'].latest is not None]
-        img, marks = lidar_render([sc[0] for sc in scans], [sc[1] for sc in scans], env.lidar_objs[0].latest[1], s.get_size())
+        img, marks = self.cached(('lidar', s.get_size()), env, lambda: lidar_render(
+            [sc[0] for sc in scans], [sc[1] for sc in scans], env.lidar_objs[0].latest[1], s.get_size()))
         s.blit(pygame.surfarray.make_surface(img), (0, 0))
         for u, v, i in marks:
             if i >= n_cars:
@@ -767,9 +928,11 @@ class Dashboard:
 
     def p_vae(self, s, env, o):
         w, h = s.get_size()
-        with torch.no_grad():
-            rec = self.decoder(o[:LATENT_DIM].unsqueeze(0).to(next(self.decoder.parameters()).device))[0]
-        recimg = (rec.permute(2, 1, 0).cpu().numpy() * 255).astype(np.uint8)
+        def decode():
+            with torch.no_grad():
+                rec = self.decoder(o[:LATENT_DIM].unsqueeze(0).to(next(self.decoder.parameters()).device))[0]
+            return (rec.permute(2, 1, 0).cpu().numpy() * 255).astype(np.uint8)
+        recimg = self.cached('vae', env, decode)
         s.blit(pygame.transform.scale(pygame.surfarray.make_surface(recimg), (w - 16, (w - 16) // 2)), (8, 8))
         z = o[:LATENT_DIM].cpu().numpy()
         y0, bw = (w - 16) // 2 + 18, (w - 16) / LATENT_DIM
@@ -858,7 +1021,7 @@ class Dashboard:
         rate = (tr['timestep'] - tr['steps0']) / el if el > 1 else 0.0
         eta = (tr['target'] - tr['timestep']) / rate if rate > 0 and tr['target'] else 0
         frac = tr['timestep'] / tr['target'] if tr['target'] else 0
-        self.text(s, f'MODE  {self.mode.upper()}', (10, 6), CYAN, self.large)
+        self.text(s, f"MODE  {self.mode.upper()}  {self.cfg['eval_name'] if self.mode == 'eval' else ''}", (10, 6), CYAN, self.large)
         pygame.draw.rect(s, GRID, (10, 40, s.get_width() - 20, 12))
         pygame.draw.rect(s, GREEN, (10, 40, int((s.get_width() - 20) * min(frac, 1)), 12))
         self.text(s, f'{100 * frac:5.1f} %', (s.get_width() - 12, 56), FG, self.small, right=True)
@@ -870,7 +1033,8 @@ class Dashboard:
                 ('PPO updates', f"{tr['updates']}  (last {tr['update_s']:.1f} s)"), ('checkpoints', f"{tr['saves']} saved"),
                 ('throughput', f'{rate:.1f} steps/s   RTF {rate * 0.05:.2f}×'),
                 ('elapsed · ETA', f'{el / 60:.1f} min · {eta / 60:.0f} min' if eta else f'{el / 60:.1f} min'),
-                ('note', tr['note'] or '-')]
+                ('job', self.status or '-'),
+                ('queue', ' → '.join(j['mode'] for j in self.cfg['queue'][:6]) or 'empty')]
         for k, (a, b) in enumerate(rows):
             self.text(s, f'{a:15}', (10, 72 + k * 18), DIM, self.mono)
             self.text(s, b, (150, 72 + k * 18), FG, self.mono)
@@ -929,7 +1093,7 @@ class Dashboard:
     def p_situations(self, s, env, o):
         denm = env.infra.warning_now() if env.infra else None
         labels = ([(f"DENM {env.infra.warning['kind']} meets ego in {denm:.1f} s ({env.infra.warning['from']})", RED)] if denm is not None else []) \
-            + ([(f'Conflict in {self.worst[0]:.1f} s: {self.worst[1]}', RED)] if self.worst else []) + detect_situations(env)
+            + ([(f'Conflict in {self.worst[0]:.1f} s: {self.worst[1]}', RED)] if self.worst else []) + self.cached('sit', env, lambda: detect_situations(env))
         for k, (label, col) in enumerate(labels[:10]):
             self.led(s, (14, 14 + k * 19), col)
             self.text(s, label, (26, 7 + k * 19), col, self.mono)
@@ -946,7 +1110,7 @@ class Dashboard:
                              (self.sim_now - c.ts) * 1000 if c.ts else None))
         if self.rsu_cam:
             c = self.rsu_cam
-            rows.append(('CAM-07', 'rgb', f'pole J{self.rsu_j}', '640×360', '10 Hz', f'#{c.n}', (self.sim_now - c.ts) * 1000 if c.ts else None))
+            rows.append(('CAM-07', 'rgb', f'pole J{self.rsu_j}', '640×360', '20 Hz', f'#{c.n}', (self.sim_now - c.ts) * 1000 if c.ts else None))
         for k, l in enumerate(env.lidar_objs):
             rows.append((f'LDR-{k:02d}', 'lidar ray', 'ego roof' if k == 0 else f'coop car {k}', f'{LIDAR_CHANNELS} ch {LIDAR_POINTS_PER_SECOND // 1000}k/s',
                          '20 Hz', f'{len(l.latest[0]):,} pts' if l.latest is not None else '-', 0 if l.latest is not None else None))
@@ -1051,13 +1215,13 @@ class Dashboard:
         return (BOTTOM - 20 - 30) // 15
 
     def p_system(self, s, env, o):
-        sim_ok = self.ms['step'] < 200
+        sim_ok = self.ms['step'] < 300
         cams_ok = all(c.frame is not None for c in self.cams.values())
         lid = sum(l.latest is not None for l in env.lidar_objs)
         denm = env.infra.warning_now() if env.infra else None
         v2x = env.infra.channel.summary(env.infra.t) if env.infra else None
         ctrl = env.vehicle.get_control()
-        rows = [('SIM', GREEN if sim_ok else ORANGE, f'sync 20 Hz · step {self.ms["step"]:5.1f} ms', f'RTF {0.05 / max(1e-3, self.loop_s):.2f}×'),
+        rows = [('SIM', GREEN if sim_ok else ORANGE, f'sync 20 Hz · step {self.ms["step"]:5.1f} ms', f'RTF {0.05 / max(1e-3, self.step_wall):.2f}×'),
                 ('SENSORS', GREEN if cams_ok and lid == len(env.lidar_objs) else ORANGE, f'{len(self.cams) + bool(self.rsu_cam)} cam · {lid}/{len(env.lidar_objs)} lidar',
                  f'{len(env.infra.rsus) if env.infra else 0} RSU'),
                 ('PERCEPT', GREEN, f'VAE z{LATENT_DIM} · {self.ms["vae"]:4.1f} ms', 'semseg→z'),
@@ -1089,7 +1253,7 @@ class Dashboard:
     def draw(self, env, o):
         t0 = time.time()
         self.loop_s, self.last_frame = t0 - self.last_frame, t0
-        self.fps = 0.9 * self.fps + 0.1 / max(1e-3, self.loop_s)
+        self.fps = 0.9 * self.fps + 0.1 / max(1e-3, self.loop_s)  # UI frames per second
         self.sim_now = env.world.get_snapshot().timestamp.elapsed_seconds
         if env.timesteps % 5 == 0:  # keep the CARLA server window on the ego
             t = env.vehicle.get_transform()
@@ -1107,7 +1271,9 @@ class Dashboard:
                   (x + 16, 8), FG, self.mono)
         right = f"sim {self.sim_t:8.2f} s   {time.strftime('%Y-%m-%d %H:%M:%S')}"
         self.text(s, right, (W - 10, 8), FG, self.mono, right=True)
-        state, scol = ('PAUSED', ORANGE) if self.paused else (self.mode.upper(), GREEN if self.mode == 'drive' else MAG)
+        q, n = self.cfg['queue'], len(appcfg.pipeline())
+        job = f' {n - len(q) + 1}/{n}' if q and q[0] == self.cfg['job'] else ''
+        state, scol = ('PAUSED', ORANGE) if self.paused else (self.mode.upper() + job, GREEN if self.mode == 'drive' else MAG)
         sw = self.text(s, state, (W - 330, 7), scol, self.bold, right=True)
         self.led(s, (W - 342 - sw, 15), scol)
         # page tabs
@@ -1131,7 +1297,9 @@ class Dashboard:
                 self.text(content, f'{type(e).__name__}: {e}'[:90], (8, 8), RED, self.small)
             if status:
                 self.text(s, status, (rect[0] + rect[2] - 6, rect[1] + 3), GREEN if status in ('live', 'nominal') else DIM, self.small, right=True)
-        self.frames.append(pygame.transform.smoothscale(s, (W // 2, H // 2)))
+        if self.need_capture:  # one replay frame per simulation step, however often the UI redraws
+            self.frames.append(pygame.transform.smoothscale(s, (W // 2, H // 2)))
+            self.need_capture = False
         self.present(s)
         self.ms['draw'] = (time.time() - t0) * 1000
 
@@ -1165,10 +1333,12 @@ def save_meta(chkpt_dir, data, new_file):
         pickle.dump(data, f)
 
 
-def main():
+def cli_config(argv):
+    '''Settings for a session started with command-line flags (old shortcuts, scripts): not saved, no restarts.'''
     p = argparse.ArgumentParser()
+    p.add_argument('--app', action='store_true', help='settings from coopdrive.json (what CoopDrive.bat uses)')
     p.add_argument('--town', default='Town07')
-    p.add_argument('--model', default=None, help='policy .pth (default: latest in the ppo_coop folder)')
+    p.add_argument('--model', default='', help='policy .pth (default: latest in the ppo_coop folder)')
     p.add_argument('--snapshot', default=None, help='save a PNG of the window every 200 steps')
     p.add_argument('--expert', action='store_true', help='drive with the waypoint expert from bc.py')
     p.add_argument('--vn', action='store_true', help='chaotic Vietnamese-style urban traffic (use with --town Town02)')
@@ -1180,53 +1350,143 @@ def main():
     p.add_argument('--train', action='store_true', help='fine-tune PPO from the latest checkpoint, then exit')
     p.add_argument('--total-timesteps', type=int, default=100000)
     p.add_argument('--episode-length', type=int, default=3000)
-    args = p.parse_args()
-    assert COOP_SECTORS, 'dashboard needs COOP_SECTORS > 0 (simulation/settings.py)'
-    assert not (args.collect and args.train), 'pick one of --collect / --train'
-    mode = 'collect' if args.collect else 'train' if args.train else 'drive'
+    a = p.parse_args(argv)
+    if a.app:
+        return appcfg.load(), True, None
+    assert not (a.collect and a.train), 'pick one of --collect / --train'
+    cfg = dict(appcfg.defaults(), town=a.town, vn=a.vn, infra=a.infra, model=a.model, fullscreen=a.fullscreen,
+               mode='collect' if a.collect else 'train' if a.train else 'drive', driver='expert' if a.expert else 'auto',
+               collect_steps=a.collect, noise=a.noise, scenarios=a.scenarios, total_timesteps=a.total_timesteps,
+               episode_length=a.episode_length)
+    return cfg, False, a.snapshot
 
-    client, world = ClientConnection(args.town).setup()
-    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, infra=args.infra)
+
+def main():
+    cfg, app, snapshot = cli_config(sys.argv[1:])
+    assert COOP_SECTORS, 'dashboard needs COOP_SECTORS > 0 (simulation/settings.py)'
+    mode, town = cfg['mode'], cfg['town']
+    seed = cfg['eval_seed']
+    if mode == 'eval':
+        random.seed(seed); np.random.seed(seed)
+    client, world = ClientConnection(town).setup()
+    if mode == 'eval':
+        client.get_trafficmanager(TM_PORT).set_random_device_seed(seed)
+    env = CarlaEnvironment(client, world, town, checkpoint_frequency=None, traffic=cfg['vn'], share=cfg['share'], infra=cfg['infra'])
     env.display_on = False  # the dashboard owns the pygame window
     encode = EncodeState(LATENT_DIM)
-    chkpt_dir = f'checkpoints/PPO_coop/{args.town}'
+    chkpt_dir = f'checkpoints/PPO_coop/{town}'
     meta = latest_meta(chkpt_dir) if mode == 'train' else None
-    agent = PPOAgent(args.town, meta['action_std_init'] if meta else 0.05)
-    policy_ok = False
+    agent = PPOAgent(town, meta['action_std_init'] if meta else 0.05)
+    policy_ok, why = False, ''
     try:
-        if args.model:
-            agent.old_policy.load_state_dict(torch.load(args.model))
-            agent.policy.load_state_dict(torch.load(args.model))
+        if cfg['model']:
+            agent.old_policy.load_state_dict(torch.load(cfg['model']))
+            agent.policy.load_state_dict(torch.load(cfg['model']))
         else:
             agent.load()
         policy_ok = True
     except Exception as e:  # no model yet, or trained with another observation size
-        print('No matching policy, the expert drives:', e)
-    assert policy_ok or mode != 'train', 'training needs a policy to start from (run bc.py train first)'
-    config = f"{args.town} {'VN' if args.vn else 'TM'}{' +INFRA' if args.infra else ''} obs {100 + COOP_OBS}"
-    dash = Dashboard(agent, policy_ok, mode, config)
+        why = f'{type(e).__name__}: {e}'
+    config = f"{town} {'VN' if cfg['vn'] else 'TM'}{' +INFRA' if cfg['infra'] else ''}{'' if cfg['share'] else ' noshare'} obs {100 + COOP_OBS}"
+    dash = Dashboard(agent, policy_ok, mode, config, cfg, app)
     sys.stdout = Tee(sys.stdout, dash.log)
-    if args.fullscreen:
+    if not policy_ok:
+        dash.log(f'no matching policy ({why[:120]}) · the expert drives', 'WARN')
+    expert_job = mode in ('collect', 'bc') or (mode == 'eval' and cfg['eval_expert'])
+    dash.driver = 'expert' if expert_job or cfg['driver'] == 'expert' or not policy_ok else 'ppo'
+    if cfg['fullscreen']:
         dash.set_fullscreen(True)
-    if args.expert and mode == 'drive':
-        dash.driver = 'expert'
-    tr = dash.train
+    tr, job = dash.train, cfg['job']
+    data = proc = None
+    eps = []
+    if mode in ('train', 'eval') and not expert_job and not policy_ok:
+        dash.fail_job('no policy to start from (run collect + bc first)')
+        mode = dash.mode = 'drive'
     if mode == 'train':
         os.makedirs(chkpt_dir, exist_ok=True)
         meta = meta or {'cumulative_score': 0, 'episode': 0, 'timestep': 0, 'action_std_init': agent.action_std}
+        if 'target' not in job:  # fixed when the job starts, so a restart continues to the same total
+            appcfg.update_job(cfg, target=meta['timestep'] + cfg['total_timesteps'])
+            dash.save_cfg()
         tr.update(timestep=meta['timestep'], steps0=meta['timestep'], episode=meta['episode'], avg=meta['cumulative_score'],
-                  target=meta['timestep'] + args.total_timesteps, std=agent.action_std)
-        dash.log(f"PPO fine-tune from timestep {meta['timestep']} · episode {meta['episode']} · σ {agent.action_std} · "
-                 f"+{args.total_timesteps:,} steps · checkpoints {chkpt_dir}", 'INFO')
-    data = None
+                  target=job['target'], std=agent.action_std)
+        dash.status = f"fine-tune → {job['target']:,} steps"
+        dash.log(f"PPO fine-tune at timestep {meta['timestep']:,} · episode {meta['episode']} · σ {agent.action_std} · "
+                 f"target {job['target']:,} · checkpoints {chkpt_dir}", 'INFO')
     if mode == 'collect':
         import bc
+        path = bc.DATA.format(town)
         data = ([], [], [], [], [])  # obs, obs_alt, act, rew, done
-        tr.update(target=args.collect)
-        dash.log(f'expert data collection · {args.collect:,} steps → {bc.DATA.format(args.town)}', 'INFO')
+        if job.get('fresh'):
+            if os.path.exists(path):
+                os.replace(path, path + '.bak')
+                dash.log(f'previous data kept as {path}.bak', 'INFO')
+            appcfg.update_job(cfg, fresh=False)  # from now on a restart resumes this collection
+            dash.save_cfg()
+        elif os.path.exists(path):
+            z = np.load(path)
+            if z['obs'].shape[1:] == (100 + COOP_OBS,):
+                data = tuple(list(z[k]) for k in ('obs', 'obs_alt', 'act', 'rew', 'done'))
+                dash.log(f'resuming collection at {len(data[0]):,} steps', 'INFO')
+            else:
+                dash.log(f"{path} has {z['obs'].shape[1]} inputs, not {100 + COOP_OBS}: starting over", 'WARN')
+        tr.update(target=cfg['collect_steps'], timestep=len(data[0]), steps0=len(data[0]))
+        dash.status = f"expert data → {path}"
+        dash.log(f"expert data collection · {cfg['collect_steps']:,} steps → {path}", 'INFO')
+    if mode == 'eval':
+        tr.update(target=cfg['eval_episodes'])
+        who = 'expert' if expert_job else cfg['model'] or 'latest PPO'
+        dash.status = f"{cfg['eval_name']} · {who} · seed {seed}"
+        dash.log(f"evaluation {cfg['eval_name']}: {cfg['eval_episodes']} episodes × {cfg['eval_steps']} steps · {who} · "
+                 f"share {'on' if cfg['share'] else 'off'}", 'INFO')
+    if mode == 'bc':
+        cmd = [sys.executable, '-u', 'bc.py', 'train', '--town', town] + (['--noshare'] if job.get('noshare') else [])
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+        lines = []
+        threading.Thread(target=lambda: [lines.append(l.rstrip()) for l in proc.stdout], daemon=True).start()
+        dash.status = 'behavior cloning ' + ('(ego + V2I only)' if job.get('noshare') else '(shared LiDAR)')
+        dash.log(f"$ {' '.join(cmd[1:])}", 'INFO')
     clock = pygame.time.Clock()
+
+    def step_async(action):
+        '''env.step in a worker thread while the UI keeps drawing and reading keys at the configured fps.'''
+        box = []
+
+        def work():
+            try:
+                box.append(env.step(action))
+            except Exception as e:  # handed back to the main thread
+                box.append(e)
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        first = True
+        while True:
+            # full fps only while the user types / scrolls: drawing holds the GIL and slows the simulation thread
+            busy = dash.handle_events(env) or time.time() - dash.last_input < 1.0
+            if first or busy or time.time() - dash.last_frame > 0.5:
+                dash.draw(env, o)
+                first = False
+            if not th.is_alive():
+                break
+            clock.tick(max(5, cfg['fps']))
+        th.join()
+        if isinstance(box[0], Exception):
+            raise box[0]
+        return box[0]
+
+    def end_episode_early():
+        client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list], True)
+        env.sensor_list.clear(); env.actor_list.clear(); env.riders.clear(); env.remove_sensors()
+
     try:
         while not dash.quit:
+            if mode == 'eval':
+                if len(eps) >= cfg['eval_episodes']:
+                    out = evaluate.write(cfg['eval_name'], {k: cfg[k] for k in appcfg.DEFAULTS if k not in ('job', 'queue')}, eps)
+                    dash.log('SUMMARY ' + ' · '.join(f'{k} {v}' for k, v in out['summary'].items()), 'INFO')
+                    dash.finish_job(f"results/{cfg['eval_name']}.json")
+                    break
+                random.seed(seed * 1000 + len(eps)); np.random.seed(seed * 1000 + len(eps))  # same route + events per episode
             observation = env.reset()
             if observation is None:
                 dash.log('reset failed (no free spawn point?), retrying', 'WARN')
@@ -1234,10 +1494,24 @@ def main():
             dash.new_episode(env)
             o = encode.process(observation)
             alt = env.coop_obs_other() if data else None
+            stats = evaluate.EpisodeStats() if mode == 'eval' else None
             steps = stuck = 0
-            done = False
+            done = crashed = False
+            reward = 0.0
             while not dash.quit:
+                if proc is not None and proc.poll() is not None and not lines:  # behavior cloning finished
+                    if proc.returncode == 0:
+                        dash.finish_job()
+                    else:
+                        dash.fail_job(f'bc.py exited with code {proc.returncode}')
+                        proc = None
+                    break
+                while proc is not None and lines:
+                    dash.log('bc │ ' + lines.pop(0), 'OUT')
                 dash.handle_events(env)
+                dash.run_pending(env)
+                if dash.quit:
+                    break
                 if dash.replay:
                     dash.draw_replay()
                     clock.tick(20)
@@ -1248,22 +1522,24 @@ def main():
                         agent.memory.dones[-1] = True
                     if data and data[-1]:
                         data[-1][-1] = True
-                    client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list], True)
-                    env.sensor_list.clear(); env.actor_list.clear(); env.riders.clear(); env.remove_sensors()
+                    end_episode_early()
                     break
                 if dash.paused:
                     dash.draw(env, o)
-                    clock.tick(20)
+                    clock.tick(max(5, cfg['fps']))
                     continue
                 t0 = time.time()
                 if dash.driver == 'expert':
                     action = expert_action(env)
-                    executed = action + np.array([np.random.normal(0, args.noise), 0.0]) if mode == 'collect' else action
+                    executed = action + np.array([np.random.normal(0, cfg['noise']), 0.0]) if mode == 'collect' else action
+                elif mode == 'eval':
+                    with torch.no_grad():
+                        action = executed = agent.old_policy.actor(o.cpu()).numpy()  # mean action: deterministic
                 else:
                     action = executed = agent.get_action(o, train=mode == 'train')
                 dash.ms['policy'] = (time.time() - t0) * 1000
                 t0 = time.time()
-                result = env.step(executed)
+                result = step_async(executed)
                 dash.ms['step'] = (time.time() - t0) * 1000
                 if result is None:
                     if mode == 'train':  # keep the rollout aligned: drop the action that got no reward
@@ -1271,13 +1547,16 @@ def main():
                             buf.pop()
                         if agent.memory.dones:
                             agent.memory.dones[-1] = True
+                    if stats:
+                        stats.m['end'] = 'sim_error'
+                        eps.append(stats.record(len(eps), dash.hit_ids))
                     dash.log('environment step failed, new episode', 'WARN')
                     break
                 observation, reward, done, info = result
                 steps += 1
                 stuck = stuck + 1 if env.velocity < 1 else 0
                 if mode == 'collect':
-                    if args.scenarios and env.timesteps % 250 == 0 and env.front_obstacle == np.inf and env.velocity > 10:
+                    if cfg['scenarios'] and env.timesteps % 250 == 0 and env.front_obstacle == np.inf and env.velocity > 10:
                         spawn_scenario(env, random.choice([1, 2]))
                     done = done or stuck > 400  # 20 s still (e.g. stuck traffic): give up this episode
                     o_np = o.cpu().numpy()
@@ -1286,25 +1565,32 @@ def main():
                     tr['timestep'] = len(data[0])
                     if not done:
                         alt = env.coop_obs_other()
-                    if len(data[0]) >= args.collect:
+                    if len(data[0]) >= cfg['collect_steps']:
                         done = True
                 elif mode == 'train':
-                    done = done or steps >= args.episode_length
+                    done = done or steps >= cfg['episode_length']
                     agent.memory.rewards.append(reward)
                     agent.memory.dones.append(done)
                     tr['timestep'] += 1
                     if tr['timestep'] == tr['target'] - 1:
                         agent.chkpt_save()
+                elif mode == 'eval':
+                    stats.step(env, reward, done, dash.hit_ids)
+                    tr['timestep'] = len(eps)
+                    if steps >= cfg['eval_steps'] and not done:
+                        eps.append(stats.record(len(eps), dash.hit_ids))  # still driving: 'max_steps'
+                        dash.log(f"eval ep {len(eps) - 1}: max steps · {stats.m['km'] * 1000:.0f} m", 'INFO')
+                        end_episode_early()
+                        break
                 dash.ep_reward += reward
-                crashed = dash.after_step(env, o, reward)
+                crashed = dash.after_step(env, o, reward) or crashed
                 if done:
                     break
                 t0 = time.time()
                 o = encode.process(observation)
                 dash.ms['vae'] = (time.time() - t0) * 1000
-                dash.draw(env, o)
-                if args.snapshot and env.timesteps % 200 == 0:
-                    pygame.image.save(dash.screen, args.snapshot)
+                if snapshot and env.timesteps % 200 == 0:
+                    pygame.image.save(dash.screen, snapshot)
             if not done:
                 continue
             # ---- episode finished
@@ -1315,11 +1601,14 @@ def main():
             env.riders.clear()
             if mode == 'collect':
                 data[-1][-1] = True  # cut an unfinished episode for the return computation
-                bc.save(args.town, *data)
-                dash.log(f'collected {len(data[0]):,} / {args.collect:,} steps (saved)', 'INFO')
-                if len(data[0]) >= args.collect:
-                    dash.log('collection complete', 'INFO')
-                    dash.quit = True
+                bc.save(town, *data)
+                dash.log(f"collected {len(data[0]):,} / {cfg['collect_steps']:,} steps (saved)", 'INFO')
+                if len(data[0]) >= cfg['collect_steps']:
+                    dash.finish_job(f'{len(data[0]):,} steps')
+            elif mode == 'eval':
+                eps.append(stats.record(len(eps), dash.hit_ids))
+                e = eps[-1]
+                dash.log(f"eval ep {e['episode']}: {e['end']} · {e['steps']} steps · {e['km'] * 1000:.0f} m · collisions {e['collisions']}", 'INFO')
             elif mode == 'train':
                 tr['episode'] += 1
                 tr['avg'] = (tr['avg'] * (tr['episode'] - 1) + dash.ep_reward) / tr['episode']
@@ -1343,8 +1632,7 @@ def main():
                 if tr['timestep'] >= tr['target']:
                     agent.chkpt_save()
                     save_meta(chkpt_dir, state, new_file=False)
-                    dash.log('fine-tune complete', 'INFO')
-                    dash.quit = True
+                    dash.finish_job(f"{tr['timestep']:,} steps")
             if (crashed or reward <= -10) and mode == 'drive':
                 dash.start_replay()  # instant replay of the last seconds before the episode ended
     except Exception:
@@ -1352,6 +1640,8 @@ def main():
         dash.log(traceback.format_exc(), 'ERR')
         raise
     finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
         sys.stdout = sys.stdout.stream if isinstance(sys.stdout, Tee) else sys.stdout
         dash.log('session closed', 'INFO')
         dash.term.close()
@@ -1364,6 +1654,7 @@ def main():
         settings.synchronous_mode, settings.fixed_delta_seconds = False, None  # leave the server usable for others
         world.apply_settings(settings)
         pygame.quit()
+    sys.exit(dash.exit_code)
 
 
 if __name__ == '__main__':

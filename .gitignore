@@ -3,3 +3,5 @@ __pycache__/
 /data/
 *.log
 replays/
+coopdrive.json
+coopdrive.json.tmp

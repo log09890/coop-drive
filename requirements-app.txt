@@ -1,0 +1,6 @@
+numpy==1.21.1
+pygame==2.1.2
+Pillow==9.4.0
+tensorboard==2.11.2
+torch==1.13.1+cu117
+torchvision==0.14.1+cu117

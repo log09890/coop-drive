@@ -38,6 +38,43 @@ def summarize(eps):
             'ends': {k: sum(e['end'] == k for e in eps) for k in sorted({e['end'] for e in eps})}}
 
 
+class EpisodeStats:
+    '''Per-episode evaluation counters (shared with the dashboard's eval mode).'''
+
+    def __init__(self):
+        self.m = dict(steps=0, near_miss_steps=0, red_runs=0, speed=0.0, km=0.0, dsteer=0.0, end='max_steps')
+        self.was_red, self.progress = False, 0.0
+
+    def step(self, env, reward, done, hits):
+        m = self.m
+        m['steps'] += 1
+        m['speed'] += env.velocity
+        m['km'] += env.velocity / 3.6 * DT / 1000
+        m['dsteer'] += abs(env.d_steer)
+        m['near_miss_steps'] += env.front_obstacle < 2 and env.velocity > 5
+        m['red_runs'] += env.red_moving and not self.was_red
+        self.was_red = env.red_moving
+        self.progress = env.current_waypoint_index / max(1, len(env.route_waypoints) - 1)
+        if done:
+            m['end'] = ('collision' if hits else 'off_lane' if env.distance_from_center > env.max_distance_from_center
+                        else 'overspeed' if env.velocity > env.max_speed else 'stuck') if reward <= -10 else                        'route_done' if self.progress > 0.98 else 'timeout'
+
+    def record(self, ep, hits):
+        m, n = self.m, max(1, self.m['steps'])
+        return {'episode': ep, 'end': m['end'], 'steps': m['steps'], 'km': m['km'], 'progress': self.progress,
+                'route_done': m['end'] == 'route_done', 'collisions': len(set(hits)),
+                'near_miss_steps': int(m['near_miss_steps']), 'red_runs': int(m['red_runs']),
+                'mean_speed': m['speed'] / n, 'jerk': m['dsteer'] / n}
+
+
+def write(name, args, eps):
+    os.makedirs('results', exist_ok=True)
+    out = {'name': name, 'args': args, 'summary': summarize(eps), 'episodes': eps}
+    with open(f'results/{name}.json', 'w') as f:
+        json.dump(out, f, indent=1, default=float)
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--town', default='Town02')
@@ -71,8 +108,7 @@ def main():
             col = world.spawn_actor(world.get_blueprint_library().find('sensor.other.collision'), carla.Transform(), attach_to=env.vehicle)
             env.sensor_list.append(col)
             col.listen(lambda e: hits.append(e.other_actor.id))
-            m = dict(steps=0, near_miss_steps=0, red_runs=0, speed=0.0, km=0.0, dsteer=0.0, end='max_steps')
-            was_red = False
+            st = EpisodeStats()
             for t in range(args.steps):
                 o = encode.process(observation)
                 if args.expert:
@@ -82,31 +118,18 @@ def main():
                         action = agent.old_policy.actor(o.cpu()).numpy()  # mean action: deterministic evaluation
                 result = env.step(action)
                 if result is None:
-                    m['end'] = 'sim_error'
+                    st.m['end'] = 'sim_error'
                     break
                 observation, reward, done, info = result
-                m['steps'] += 1
-                m['speed'] += env.velocity
-                m['km'] += env.velocity / 3.6 * DT / 1000
-                m['dsteer'] += abs(env.d_steer)
-                m['near_miss_steps'] += env.front_obstacle < 2 and env.velocity > 5
-                m['red_runs'] += env.red_moving and not was_red
-                was_red = env.red_moving
-                progress = env.current_waypoint_index / max(1, len(env.route_waypoints) - 1)
+                st.step(env, reward, done, hits)
                 if done:
-                    m['end'] = ('collision' if hits else 'off_lane' if env.distance_from_center > env.max_distance_from_center
-                                else 'overspeed' if env.velocity > env.max_speed else 'stuck') if reward <= -10 else \
-                               'route_done' if progress > 0.98 else 'timeout'
                     break
+            m = st.m
             if m['end'] == 'max_steps':  # still alive: tidy up like the env does at an episode end
                 client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list], True)
                 env.sensor_list.clear(); env.actor_list.clear(); env.remove_sensors()
             env.riders.clear()
-            n = max(1, m['steps'])
-            eps.append({'episode': ep, 'end': m['end'], 'steps': m['steps'], 'km': m['km'], 'progress': progress,
-                        'route_done': m['end'] == 'route_done', 'collisions': len(set(hits)),
-                        'near_miss_steps': int(m['near_miss_steps']), 'red_runs': int(m['red_runs']),
-                        'mean_speed': m['speed'] / n, 'jerk': m['dsteer'] / n})
+            eps.append(st.record(ep, hits))
             print(f'{args.name} ep {ep}: {eps[-1]["end"]}, {m["steps"]} steps, {m["km"] * 1000:.0f} m, '
                   f'collisions {eps[-1]["collisions"]}, near-miss {eps[-1]["near_miss_steps"]} steps', flush=True)
     finally:
@@ -116,10 +139,7 @@ def main():
         if env.infra:
             env.infra.destroy(client)
         s = world.get_settings(); s.synchronous_mode, s.fixed_delta_seconds = False, None; world.apply_settings(s)
-    os.makedirs('results', exist_ok=True)
-    out = {'name': args.name, 'args': vars(args), 'summary': summarize(eps), 'episodes': eps}
-    with open(f'results/{args.name}.json', 'w') as f:
-        json.dump(out, f, indent=1, default=float)
+    out = write(args.name, vars(args), eps)
     print('SUMMARY', args.name, json.dumps(out['summary']))
 
 

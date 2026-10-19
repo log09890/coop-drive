@@ -4,6 +4,11 @@ rem If the server dies, it is restarted and the dashboard retried, 3 times.
 chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 cd /d "%~dp0"
+rem Without arguments this is the app (settings, modes and the pipeline from the dashboard terminal).
+if "%~1"=="" (
+    call CoopDrive.bat
+    goto :eof
+)
 set TRIES=0
 
 :start
