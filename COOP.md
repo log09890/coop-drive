@@ -31,9 +31,20 @@ thành `COOP_SECTORS` khoảng cách vật cản gần nhất theo từng góc, 
 
 ### Dashboard
 
-`venv\Scripts\python dashboard.py` (hoặc `--model đường/dẫn.pth`): 6 ô — xe chạy, LiDAR hợp tác kiểu CODD, cảm biến, xử lý (VAE + PPO), logic (reward và luật dừng), tình huống giao thông (bản đồ + nhãn tự nhận diện).
-Phím: `1` người băng qua đường, `2` xe chạy chậm phía trước, `3` xe đỗ chắn đường, `R` episode mới, `Esc` thoát.
-Lưu ý: agent chỉ có lái và ga (không có phanh) như repo gốc, nên chưa xử lý được kịch bản 2 và 3.
+`Dashboard.bat` (shortcut "Coop-Drive Dashboard") hoặc `venv\Scripts\python dashboard.py [--town Town02 --vn] [--model x.pth] [--expert]`.
+6 ô: camera, LiDAR hợp tác kiểu CODD, cảm biến, VAE · PPO, reward, traffic (bản đồ + nhãn tình huống) và Console (log + lệnh).
+Bấm `/` hoặc Enter để gõ lệnh, `/help` để xem: `/spawn <event>`, `/chaos on|off|<s>`, `/density <n>`, `/driver expert|ppo`,
+`/weather clear|cloudy|rain|sunset`, `/pause`, `/reset`, `/snapshot`, `/clear`, `/quit`.
+Action thứ hai: > 0 là ga, < 0 là phanh. Chưa có model khớp observation thì tài xế mẫu lái.
+
+### Giao thông đô thị kiểu Việt Nam (`--vn`, nên dùng Town02)
+
+Shortcut "Coop-Drive VN Traffic". `simulation/vn_traffic.py`:
+- 80 xe máy, 8 xe đạp, 12 ô tô, 50 người đi bộ băng qua đường bất kỳ đâu; bám đuôi sát, tốc độ lệch nhau, một phần vượt đèn đỏ / lờ biển báo, xe máy đổi làn liên tục. Xe máy ở xa được dời về quanh ego để mật độ luôn dày.
+- Đèn đỏ thật (không ép xanh cho ego): xe máy và ô tô không xếp hàng mà dồn kín các ô từ vạch dừng trở lại, lấn cả làn ngược chiều; ô tô dàn ngang.
+- Pha bất ngờ (ngẫu nhiên ~5 s, hoặc `/spawn`): `cutin` tạt đầu, `encroach` lấn làn ngược chiều, `overtake` vượt ẩu rồi chèn, `suddenstop` phanh gấp, `jaywalk` người chạy qua đường, `swerve` đang bên trái cắt sang vỉa hè phải, `wrongway` đi ngược chiều sát lề, `pullout` từ vỉa hè lao ra, `zigzag` lạng lách, `flock` đàn xe máy vượt hai bên, `surround` xe máy vây ô tô. Ngoài ra còn `ped`, `slow`, `parked`.
+- Xe do script lái tự giữ khoảng cách theo kích thước xe; xe nào lật/bay được đặt lại trên đường; hybrid physics cho xe ở xa (> 70 m).
+- Train/thu dữ liệu trong môi trường này: `bc.py collect --town Town02 --vn`, `continuous_driver.py --town Town02 --vn-traffic`. Chạy khoảng 6–7 bước/giây với dashboard.
 
 Dọn xe/sensor sót lại sau một lần crash: `venv\Scripts\python clean_world.py`. Cả chuỗi thu dữ liệu → BC → fine-tune: `sh pipeline.sh`.
 

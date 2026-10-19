@@ -13,6 +13,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+from simulation.connection import carla
 from encoder_init import EncodeState
 from networks.on_policy.ppo.ppo import ActorCritic
 from parameters import LATENT_DIM, GAMMA, COOP_OBS, PPO_CHECKPOINT_DIR
@@ -29,9 +30,11 @@ def expert_action(env, lookahead=6):
     angle = math.atan2(target.y - t.location.y, target.x - t.location.x) - math.atan2(fwd.y, fwd.x)
     angle = (angle + math.pi) % (2 * math.pi) - math.pi  # left-handed UE4: positive = target on the right = steer right
     steer = float(np.clip(1.5 * angle, -1, 1))
-    # reward peaks at 15-22 km/h (>25 ends the episode); slow down linearly to a stop 7 m before an obstacle in the lane
+    # reward peaks at 15-22 km/h (>25 ends the episode); slow down linearly to a stop 4 m before an obstacle in the lane
     # shortcut: the corridor is straight ahead, so in sharp curves it can miss/catch things; use the route waypoints if that matters
-    target_speed = min(20.0, max(0.0, (env.front_obstacle - 7.0) * 1.5))
+    target_speed = min(20.0, max(0.0, (env.front_obstacle - 4.0) * 1.5))  # creep with the flow: VN traffic never leaves 7 m
+    if env.vehicle.is_at_traffic_light() and env.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
+        target_speed = 0.0  # only reachable in --vn mode, elsewhere the env turns the ego's lights green
     if target_speed < 1:
         pedal = -1.0
     elif env.velocity > target_speed + 2:
@@ -46,7 +49,7 @@ def collect(args):
     from simulation.environment import CarlaEnvironment
     from simulation.scenarios import spawn_scenario
     client, world = ClientConnection(args.town).setup()
-    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None)
+    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn)
     encode = EncodeState(LATENT_DIM)
     obs_l, act_l, rew_l, done_l = [], [], [], []
     while len(obs_l) < args.steps:
@@ -129,6 +132,7 @@ if __name__ == '__main__':
     p.add_argument('--town', default='Town07')
     p.add_argument('--steps', type=int, default=40000)
     p.add_argument('--noise', type=float, default=0.2, help='steer noise std while collecting')
+    p.add_argument('--vn', action='store_true', help='collect in chaotic Vietnamese-style traffic (use with --town Town02)')
     p.add_argument('--no-scenarios', dest='scenarios', action='store_false', help='no pedestrians / slow cars while collecting')
     p.add_argument('--epochs', type=int, default=30)
     p.add_argument('--action-std', type=float, default=0.05, help='PPO exploration for the fine-tune, small to keep the BC behaviour')

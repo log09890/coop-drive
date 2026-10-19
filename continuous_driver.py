@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument('--episode-length', type=int, default=EPISODE_LENGTH, help='max timesteps in an episode')
     parser.add_argument('--train', default=True, type=boolean_string, help='is it training?')
     parser.add_argument('--town', type=str, default="Town07", help='which town do you like?')
+    parser.add_argument('--vn-traffic', action='store_true', help='chaotic Vietnamese-style urban traffic (use with --town Town02)')
     parser.add_argument('--load-checkpoint', type=bool, default=MODEL_LOAD, help='resume training?')
     parser.add_argument('--torch-deterministic', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True, help='if toggled, `torch.backends.cudnn.deterministic=False`')
     parser.add_argument('--cuda', type=lambda x:bool(strtobool(x)), default=True, nargs='?', const=True, help='if toggled, cuda will not be enabled by deafult')
@@ -114,9 +115,9 @@ def runner():
         logging.error("Connection has been refused by the server.")
         ConnectionRefusedError
     if train:
-        env = CarlaEnvironment(client, world,town)
+        env = CarlaEnvironment(client, world,town, traffic=args.vn_traffic)
     else:
-        env = CarlaEnvironment(client, world,town, checkpoint_frequency=None)
+        env = CarlaEnvironment(client, world,town, checkpoint_frequency=None, traffic=args.vn_traffic)
     encode = EncodeState(LATENT_DIM)
 
 

@@ -11,7 +11,7 @@ from simulation.settings import *
 
 class CarlaEnvironment():
 
-    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True) -> None:
+    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True, traffic=False) -> None:
 
 
         self.client = client
@@ -44,6 +44,16 @@ class CarlaEnvironment():
         self.actor_list = list()
         self.walker_list = list()
         self.create_pedestrians()
+        # traffic=True: chaotic Vietnamese-style background traffic (motorbikes, jaywalkers), kept across episodes
+        self.traffic = None
+        self.riders = []
+        self.vehicle_locs = []
+        self.vehicle_xy, self.vehicle_ids, self.vehicle_ext = np.zeros((0, 2)), np.zeros(0), np.zeros((0, 2))
+        if traffic:
+            from simulation.vn_traffic import VNTraffic
+            spawns = self.map.get_spawn_points()
+            ego_spawn = spawns[38] if town == "Town07" else spawns[1] if town == "Town02" else None
+            self.traffic = VNTraffic(client, world, avoid=ego_spawn.location if ego_spawn else None)
 
 
 
@@ -62,6 +72,7 @@ class CarlaEnvironment():
 
             # Blueprint of our main vehicle
             vehicle_bp = self.get_vehicle(CAR_NAME)
+            vehicle_bp.set_attribute('role_name', 'hero')  # centre of the TM hybrid-physics radius
 
             if self.town == "Town07":
                 transform = self.map.get_spawn_points()[38] #Town7  is 38 
@@ -74,6 +85,11 @@ class CarlaEnvironment():
                 self.total_distance = 250
 
             self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
+            for _ in range(100):  # background traffic may be passing over the spawn point: let it clear
+                if self.vehicle is not None or not COOP_SECTORS:
+                    break
+                self.world.tick()
+                self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
             self.actor_list.append(self.vehicle)
 
 
@@ -168,7 +184,7 @@ class CarlaEnvironment():
                     self.world.tick()
             self.collision_history.clear()
 
-            self.episode_start_time = time.time()
+            self.episode_start_time = self.now()
             return [self.image_obs, self.navigation_obs]
 
         except:
@@ -222,9 +238,17 @@ class CarlaEnvironment():
                 self.throttle = 1.0
             if COOP_SECTORS:
                 self.world.tick()
+                vs = self.world.get_actors().filter('vehicle.*')
+                self.vehicle_locs = [(a.id, a.get_location()) for a in vs]  # for rider clearance
+                self.vehicle_xy = np.array([(l.x, l.y) for _, l in self.vehicle_locs]).reshape(-1, 2)
+                self.vehicle_ids = np.array([i for i, _ in self.vehicle_locs])
+                self.vehicle_ext = np.array([(a.bounding_box.extent.x, a.bounding_box.extent.y) for a in vs]).reshape(-1, 2)
+                self.riders = [r for r in self.riders if r.step()]  # scripted reckless motorbikes
+                if self.traffic:
+                    self.traffic.update(self)
             
             # Traffic Light state
-            if self.vehicle.is_at_traffic_light():
+            if self.vehicle.is_at_traffic_light() and not self.traffic:  # VN mode: real lights, the swarm waits at red
                 traffic_light = self.vehicle.get_traffic_light()
                 if traffic_light.get_state() == carla.TrafficLightState.Red:
                     traffic_light.set_state(carla.TrafficLightState.Green)
@@ -279,7 +303,7 @@ class CarlaEnvironment():
             elif self.distance_from_center > self.max_distance_from_center:
                 done = True
                 reward = -10
-            elif max(self.episode_start_time, self.last_blocked) + 10 < time.time() and self.velocity < 1.0:  # stopping for an obstacle (and 10 s after it clears) is fine
+            elif max(self.episode_start_time, self.last_blocked) + 10 < self.now() and self.velocity < 1.0:  # stopping for an obstacle (and 10 s after it clears) is fine
                 reward = -10
                 done = True
             elif self.velocity > self.max_speed:
@@ -506,6 +530,11 @@ class CarlaEnvironment():
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
 
 
+    # Seconds for the episode rules: simulated time in sync mode (the sim may run slower than real time)
+    def now(self):
+        return self.timesteps * 0.05 if COOP_SECTORS else time.time()
+
+
     # Wait for sensor data; in sync mode (coop) the sim only moves when we tick
     def wait_for(self, ready):
         t = time.time()
@@ -531,7 +560,7 @@ class CarlaEnvironment():
         self.front_obstacle = corridor_distance(clouds, poses, path, ext.y + 0.3, z_min=0.3, z_max=1.5,
                                                 ego_pose=ego.latest[1], ego_half_extent=(ext.x + 0.3, ext.y + 0.3)) if len(path) > 1 else np.inf
         if self.front_obstacle < 10:
-            self.last_blocked = time.time()
+            self.last_blocked = self.now()
         return np.append(sectors, min(self.front_obstacle, COOP_CORRIDOR) / COOP_CORRIDOR)
 
 
