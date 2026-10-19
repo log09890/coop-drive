@@ -1,14 +1,20 @@
 '''
-Live dashboard for the coop PPO agent (needs COOP_SECTORS > 0 and a running CARLA server).
+Coop-Drive research console: live multi-view dashboard for the coop PPO agent (needs COOP_SECTORS > 0 and a running
+CARLA server). It can also record expert data or fine-tune PPO while you watch.
 
-  python dashboard.py [--town Town02 --vn] [--model path.pth] [--expert]
+  python dashboard.py --town Town02 --vn --infra            drive (PPO if a matching model loads, else the expert)
+  python dashboard.py --town Town02 --vn --infra --collect 40000   record expert data for bc.py train
+  python dashboard.py --town Town02 --vn --infra --train     fine-tune PPO from the latest checkpoint
 
-Press / or Enter to type a command, /help lists them.
+F1-F5 switch pages. Type commands straight into the terminal (help lists them); the session log is saved in logs/.
 '''
 import argparse
 import collections
 import math
 import os
+import pickle
+import random
+import sys
 import time
 import weakref
 import numpy as np
@@ -19,58 +25,99 @@ from simulation.environment import CarlaEnvironment
 from simulation.coop import pose_matrix, to_ego
 from simulation.scenarios import spawn_scenario
 from simulation.vn_traffic import MOTORBIKES, BICYCLES, EVENTS
-from simulation.settings import COOP_SECTORS, COOP_CORRIDOR
+from simulation.settings import COOP_SECTORS, COOP_CORRIDOR, COOP_VEHICLES, COOP_OBS, LIDAR_CHANNELS, LIDAR_POINTS_PER_SECOND
 from encoder_init import EncodeState
 from autoencoder.decoder import Decoder
 from networks.on_policy.ppo.agent import PPOAgent
-from parameters import LATENT_DIM
+from parameters import LATENT_DIM, PPO_CHECKPOINT_DIR
 from bc import expert_action
 from insight import closest_approach, input_sensitivity, group_sensitivity, SessionMetrics
+from term import Terminal, nice_ticks
 
-W, H, HEAD, CONSOLE = 1280, 840, 28, 118  # canvas; the window is scaled to fit the screen
-BIG, CELL = (640, 340), (320, 352)
-BG, PANEL, FG, DIM = (12, 12, 16), (22, 22, 30), (230, 230, 230), (130, 130, 140)
-RED, ORANGE, YELLOW, GREEN, CYAN = (255, 70, 50), (255, 150, 30), (240, 210, 60), (80, 220, 120), (70, 200, 255)
+W, H, HEAD, TABS, BOTTOM = 1600, 900, 30, 24, 236  # canvas; the window is scaled to fit the screen
+TOP = HEAD + TABS
+BIG, BEV = (800, 450), (400, 400)  # chase camera, top-down camera (40 m up, 70 deg fov -> 56 m wide)
+BEV_M = 2 * 40 * math.tan(math.radians(35))  # metres across the BEV image
+BG, PANEL, EDGE, HEADC, GRID = (8, 10, 14), (14, 17, 23), (40, 48, 62), (21, 26, 35), (30, 36, 48)
+FG, DIM = (212, 220, 230), (108, 120, 136)
+RED, ORANGE, YELLOW, GREEN, CYAN, MAG = (255, 72, 72), (255, 146, 40), (240, 206, 60), (70, 220, 120), (0, 186, 255), (210, 120, 255)
+LEVEL_COLOR = {'INFO': FG, 'WARN': ORANGE, 'ERR': RED, 'CMD': CYAN, 'OUT': (170, 182, 196), 'EVT': MAG, 'SYS': DIM}
 SCENARIOS = {'ped': 1, 'slow': 2, 'parked': 3}
 WEATHER = {'clear': 'ClearNoon', 'cloudy': 'CloudyNoon', 'rain': 'HardRainNoon', 'sunset': 'ClearSunset'}
+SERIES = 600  # 30 s of samples at 20 Hz
+
+# camera rigs on the ego: size, mount, fov, sensor_tick (0: every frame)
+CAMS = {'chase': (BIG, carla.Transform(carla.Location(x=-6.0, z=3.0), carla.Rotation(pitch=-15.0)), 90, 0.0),
+        'hood': ((640, 360), carla.Transform(carla.Location(x=1.6, z=1.45), carla.Rotation(pitch=-4.0)), 90, 0.2),
+        'rear': ((480, 270), carla.Transform(carla.Location(x=-2.4, z=1.2), carla.Rotation(yaw=180.0)), 90, 0.2),
+        'mirror_l': ((480, 270), carla.Transform(carla.Location(x=0.6, y=-1.1, z=1.1), carla.Rotation(yaw=-160.0)), 60, 0.2),
+        'mirror_r': ((480, 270), carla.Transform(carla.Location(x=0.6, y=1.1, z=1.1), carla.Rotation(yaw=160.0)), 60, 0.2),
+        'bev': (BEV, carla.Transform(carla.Location(z=40.0), carla.Rotation(pitch=-90.0)), 70, 0.1)}
+META = {  # panel: (tag, title)
+    'chase': ('CAM-01', 'CHASE · 3RD PERSON'), 'hood': ('CAM-02', 'FRONT · HOOD'), 'rear': ('CAM-03', 'REAR VIEW'),
+    'mirror_l': ('CAM-04', 'MIRROR · LEFT'), 'mirror_r': ('CAM-05', 'MIRROR · RIGHT'), 'bev': ('CAM-06', 'BEV · TRAFFIC OVERLAY'),
+    'rsu': ('CAM-07', 'RSU POLE · NEAREST JUNCTION'), 'semseg': ('CAM-00', 'SEMANTIC INPUT 160×80'),
+    'lidar': ('LDR-FUSE', 'COOPERATIVE LIDAR · EGO FRAME'), 'radar': ('LDR-SECT', 'SECTOR RANGE · POLICY ATTENTION'),
+    'vae': ('PER-VAE', 'VAE RECONSTRUCTION · LATENT z'), 'policy': ('POL-PPO', 'ACTOR · CRITIC · ATTRIBUTION'),
+    'reward': ('RWD', 'REWARD TERMS · TERMINATION'), 'train': ('TRN', 'RUN CONTROL'), 'v2x': ('V2X', 'CHANNEL · RSU · SPaT · DENM'),
+    'readout': ('TLM', 'VEHICLE TELEMETRY'), 'situations': ('SIT', 'SITUATION ASSESSMENT'), 'sensors': ('SNS', 'SENSOR REGISTRY'),
+    'metrics': ('MET', 'SESSION METRICS · EVENT TIMELINE 60 s'),
+    'ch_speed': ('CH-01', 'SPEED km/h'), 'ch_ctrl': ('CH-02', 'CONTROL OUTPUT'), 'ch_reward': ('CH-03', 'STEP REWARD'),
+    'ch_safety': ('CH-04', 'FRONT GAP m · MIN TTC s'), 'ch_v2x': ('CH-05', 'V2X RATE · LATENCY'), 'ch_value': ('CH-06', 'CRITIC V(s) · π PEDAL'),
+    'ch_episodes': ('CH-07', 'EPISODE RETURN'), 'ch_perf': ('CH-08', 'LOOP TIMING ms'),
+    'terminal': ('TTY0', 'TERMINAL'), 'system': ('SYS', 'SYSTEM STATUS')}
+PAGES = {  # name: [(panel, (x, y, w, h))], page area y 56..660
+    'overview': [('chase', (0, 56, 800, 380)), ('lidar', (804, 56, 796, 380)), ('bev', (0, 440, 320, 220)),
+                 ('readout', (324, 440, 420, 220)), ('ch_speed', (748, 440, 420, 220)), ('situations', (1172, 440, 428, 220))],
+    'cameras': [('chase', (0, 56, 532, 300)), ('hood', (536, 56, 532, 300)), ('rsu', (1072, 56, 528, 300)),
+                ('mirror_l', (0, 360, 396, 300)), ('rear', (400, 360, 396, 300)), ('mirror_r', (800, 360, 396, 300)),
+                ('bev', (1200, 360, 400, 300))],
+    'sensors': [('semseg', (0, 56, 400, 300)), ('vae', (404, 56, 400, 300)), ('radar', (808, 56, 360, 300)),
+                ('v2x', (1172, 56, 428, 300)), ('sensors', (0, 360, 800, 300)), ('lidar', (804, 360, 796, 300))],
+    'charts': [(n, (k % 4 * 401, 56 + k // 4 * 304, 397, 300)) for k, n in enumerate(
+        ['ch_speed', 'ch_ctrl', 'ch_reward', 'ch_safety', 'ch_v2x', 'ch_value', 'ch_episodes', 'ch_perf'])],
+    'policy': [('policy', (0, 56, 532, 300)), ('reward', (536, 56, 532, 300)), ('train', (1072, 56, 528, 300)),
+               ('ch_episodes', (0, 360, 532, 300)), ('ch_reward', (536, 360, 532, 300)), ('metrics', (1072, 360, 528, 300))],
+}
+PAGE_AREA = (0, 56, W, 604)
+STRIP = [('terminal', (0, H - BOTTOM, 1100, BOTTOM)), ('system', (1104, H - BOTTOM, 496, BOTTOM))]
 HELP = [
-    ('/spawn <event>', 'ped slow parked ' + ' '.join(EVENTS)),
-    ('/chaos on|off|<sec>', 'random surprise events near the ego'),
-    ('/density <n>', 'number of motorbikes (kept around the ego)'),
-    ('/driver expert|ppo', 'who drives'),
-    ('/weather <name>', ' '.join(WEATHER)),
-    ('/v2x <key> <value>', 'latency <ms> · loss <%> · range <m> · gps <m> · cars|bikes <% fitted> · on · off'),
-    ('/pause', 'freeze / resume the simulation'),
-    ('/reset', 'new episode'),
-    ('/replay', 'play back the last ~10 s (also automatic after a collision)'),
-    ('/gif [file]', 'save the last ~10 s as an animated GIF in replays/'),
-    ('/focus <panel>|off', 'enlarge a panel: ' + ' '.join(['camera', 'lidar', 'sensors', 'policy', 'reward', 'traffic'])),
-    ('/snapshot [file]', 'save the window as PNG'),
-    ('/clear', 'clear the log'),
-    ('/quit', 'exit'),
-    ('↑ ↓  Tab', 'command history, completion'),
+    ('page <name|1-5>', 'overview cameras sensors charts policy   (or F1-F5)'),
+    ('focus <panel>|off', 'one panel over the whole page'),
+    ('spawn <event>', 'ped slow parked ' + ' '.join(EVENTS)),
+    ('chaos on|off|<sec>', 'random surprise events near the ego'),
+    ('density <n>', 'number of motorbikes kept around the ego'),
+    ('driver expert|ppo', 'who drives (locked while collecting / training)'),
+    ('weather <name>', ' '.join(WEATHER)),
+    ('v2x <key> <value>', 'latency <ms> · loss <%> · range <m> · gps <m> · cars|bikes <%> · on · off'),
+    ('pause | reset', 'freeze / resume · new episode'),
+    ('replay | gif [file]', 'play back / save the last ~10 s'),
+    ('snapshot [file]', 'save the window as PNG'),
+    ('stats | history | log', 'session metrics · typed commands · log file path'),
+    ('cls | quit', 'clear the terminal · exit'),
+    ('keys', 'Enter run · ↑↓ history · Tab complete · PgUp/PgDn or wheel scroll · Esc clear'),
 ]
-PANELS = {'camera': (0, HEAD, *BIG), 'lidar': (BIG[0], HEAD, *BIG), 'sensors': (0, HEAD + BIG[1] + 2, *CELL),
-          'policy': (CELL[0], HEAD + BIG[1] + 2, *CELL), 'reward': (2 * CELL[0], HEAD + BIG[1] + 2, *CELL),
-          'traffic': (3 * CELL[0], HEAD + BIG[1] + 2, *CELL)}
 COMPLETE = {'spawn': sorted(SCENARIOS) + sorted(EVENTS), 'weather': sorted(WEATHER), 'driver': ['expert', 'ppo'],
-            'focus': sorted(PANELS) + ['off'], 'chaos': ['on', 'off'], 'v2x': ['latency', 'loss', 'range', 'gps', 'cars', 'bikes', 'on', 'off']}
-BEV = (300, 180)  # top-down camera: 40 m up, 70 deg fov -> 56 m wide
-BEV_PX_PER_M = BEV[0] / (2 * 40 * math.tan(math.radians(35)))
+            'focus': sorted(META) + ['off'], 'chaos': ['on', 'off'], 'page': list(PAGES),
+            'v2x': ['latency', 'loss', 'range', 'gps', 'cars', 'bikes', 'on', 'off']}
+COMMANDS = ['help', 'page', 'focus', 'spawn', 'chaos', 'density', 'driver', 'weather', 'v2x', 'pause', 'reset', 'replay',
+            'gif', 'snapshot', 'stats', 'history', 'log', 'cls', 'clear', 'quit']
 
 
 class ChaseCamera:
-    '''RGB camera on the ego (third person by default, or top-down for the BEV); the callback only stores the frame.'''
+    '''RGB camera on a vehicle (or fixed in the world when vehicle is None); the callback only stores the frame.'''
 
-    def __init__(self, vehicle, size=BIG, transform=None, fov=None):
-        bp = vehicle.get_world().get_blueprint_library().find('sensor.camera.rgb')
+    def __init__(self, vehicle, size=BIG, transform=None, fov=None, tick=0.0, world=None):
+        world = world or vehicle.get_world()
+        bp = world.get_blueprint_library().find('sensor.camera.rgb')
         bp.set_attribute('image_size_x', str(size[0]))
         bp.set_attribute('image_size_y', str(size[1]))
+        bp.set_attribute('sensor_tick', str(tick))
         if fov:
             bp.set_attribute('fov', str(fov))
-        self.frame = None
+        self.frame, self.n, self.ts, self.size, self.tick = None, 0, None, size, tick
         transform = transform or carla.Transform(carla.Location(x=-6.0, z=3.0), carla.Rotation(pitch=-15.0))
-        self.sensor = vehicle.get_world().spawn_actor(bp, transform, attach_to=vehicle)
+        self.sensor = world.spawn_actor(bp, transform, attach_to=vehicle) if vehicle else world.spawn_actor(bp, transform)
         weak_self = weakref.ref(self)
         self.sensor.listen(lambda image: ChaseCamera._on_image(weak_self, image))
 
@@ -80,11 +127,13 @@ class ChaseCamera:
         if self:
             a = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)
             self.frame = a[:, :, 2::-1].swapaxes(0, 1).copy()  # BGRA -> RGB, (w, h, 3) for pygame
+            self.n, self.ts = self.n + 1, image.timestamp
 
 
-def lidar_render(clouds, poses, ego_pose, size, cam_back=28.0, cam_up=38.0, tilt=55.0, focal=330.0):
+def lidar_render(clouds, poses, ego_pose, size, cam_back=28.0, cam_up=38.0, tilt=55.0, focal=None):
     '''CODD-style fused point cloud: oblique perspective from behind/above the ego, red near any sensor -> yellow far.'''
     w, h = size
+    focal = focal or 330.0 * w / 640
     img = np.zeros((w, h, 3), np.uint8)
     ego_inv = np.linalg.inv(pose_matrix(*ego_pose))
     pts = [to_ego(c, p, ego_inv) for c, p in zip(clouds, poses)]
@@ -161,8 +210,50 @@ def detect_situations(env):
     return out or [('Clear', GREEN)]
 
 
+def ego_frame(env):
+    '''Ego transform and a rotation of world xy offsets into (forward, right) metres.'''
+    t = env.vehicle.get_transform()
+    c, sn = math.cos(math.radians(t.rotation.yaw)), math.sin(math.radians(t.rotation.yaw))
+    return t, lambda dx, dy: (dx * c + dy * sn, -dx * sn + dy * c)
+
+
+def conflicts(env, radius=30.0):
+    '''Every road user within radius m in the ego frame: (actor, (fwd, right), velocity, rel. velocity, ttc, miss distance).'''
+    t, rot = ego_frame(env)
+    ev = env.vehicle.get_velocity()
+    out = []
+    for a in list(env.world.get_actors().filter('vehicle.*')) + list(env.world.get_actors().filter('walker.pedestrian.*')):
+        if a.id == env.vehicle.id:
+            continue
+        l, v = a.get_location(), a.get_velocity()
+        p = rot(l.x - t.location.x, l.y - t.location.y)
+        if math.hypot(*p) > radius:
+            continue
+        ttc, dist = closest_approach([p], [rot(v.x - ev.x, v.y - ev.y)])
+        out.append((a, p, rot(v.x, v.y), rot(v.x - ev.x, v.y - ev.y), float(ttc[0]), float(dist[0])))
+    return out
+
+
+class Tee:
+    '''Copies stdout (env, agent and CARLA prints) into the dashboard terminal.'''
+
+    def __init__(self, stream, sink):
+        self.stream, self.sink, self.buf = stream, sink, ''
+
+    def write(self, s):
+        self.stream.write(s)
+        self.buf += s
+        *done, self.buf = self.buf.split('\n')
+        for line in done:
+            if line.strip():
+                self.sink(line.rstrip(), 'SYS')
+
+    def flush(self):
+        self.stream.flush()
+
+
 class Dashboard:
-    def __init__(self, agent, policy_ok):
+    def __init__(self, agent, policy_ok, mode, config):
         try:  # without this Windows magnifies the window by the display scale (200 %) and it no longer fits
             import ctypes
             ctypes.windll.user32.SetProcessDPIAware()
@@ -171,109 +262,172 @@ class Dashboard:
         pygame.init()
         pygame.key.set_repeat(400, 30)
         info = pygame.display.Info()
-        k = min(info.current_w * 0.95 / W, (info.current_h - 120) * 0.95 / H)
+        k = min(1.0, info.current_w * 0.96 / W, (info.current_h - 100) * 0.96 / H)
         self.window = pygame.display.set_mode((int(W * k), int(H * k)), pygame.RESIZABLE)
         self.screen = pygame.Surface((W, H))  # everything is drawn here at a fixed size
-        pygame.display.set_caption('Coop-Drive')
-        self.font = pygame.font.SysFont('segoeui,dejavusans', 14)
-        self.small = pygame.font.SysFont('segoeui,dejavusans', 12)
-        self.big = pygame.font.SysFont('segoeui,dejavusans', 15, bold=True)
-        self.mono = pygame.font.SysFont('consolas,dejavusansmono', 14)
-        self.agent, self.policy_ok = agent, policy_ok
+        self.run_id = time.strftime('%Y%m%d-%H%M%S')
+        pygame.display.set_caption(f'Coop-Drive research console · run {self.run_id}')
+        f = 'consolas,dejavusansmono,couriernew'
+        self.mono = pygame.font.SysFont(f, 13)
+        self.small = pygame.font.SysFont(f, 11)
+        self.bold = pygame.font.SysFont(f, 13, bold=True)
+        self.large = pygame.font.SysFont(f, 22, bold=True)
+        self.agent, self.policy_ok, self.mode, self.config = agent, policy_ok, mode, config
         self.decoder = Decoder(LATENT_DIM).to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         self.decoder.load()
         self.decoder.eval()
-        self.events, self.chase, self.episode, self.reward_hist = [], None, 0, []
-        self.driver = 'ppo' if policy_ok else 'expert'
-        self.typing, self.line, self.show_help = False, '', False
+        self.term = Terminal(os.path.join('logs', f'session_{self.run_id}.log'))
+        self.cams, self.rsu_cam, self.rsu_j, self.collision = {}, None, None, None
+        self.episode, self.ep_reward, self.ep_hist = 0, 0.0, []  # ep_hist: returns of finished episodes
+        self.driver = 'ppo' if policy_ok and mode != 'collect' else 'expert'
+        self.line, self.hist_i, self.page, self.focus = '', 0, 'overview', None
         self.paused = self.quit = self.want_reset = False
-        self.ep_reward = 0.0
-        self.history, self.hist_i = [], 0
-        self.focus = None
         self.metrics, self.timeline, self.sim_t = SessionMetrics(), [], 0.0  # timeline: (sim time s, kind, label)
         self.frames = collections.deque(maxlen=120)  # ~10+ s of half-size window frames for the instant replay
         self.replay, self.replay_i = None, 0
-        self.bev = self.collision = None
-        self.hits = []
+        self.hits, self.series = [], collections.defaultdict(lambda: collections.deque(maxlen=SERIES))
+        self.ms = collections.defaultdict(float)  # latest timings: step, vae, policy, draw
+        self.mean, self.value, self.sens, self.sens_step = np.zeros(2), 0.0, None, -1
+        self.worst, self.prev_speed, self.accel, self.yaw_rate, self.prev_yaw = None, 0.0, 0.0, 0.0, None
+        self.train = {'timestep': 0, 'target': 0, 'episode': 0, 'avg': 0.0, 'updates': 0, 'update_s': 0.0, 'saves': 0,
+                      'start': time.time(), 'steps0': 0, 'std': getattr(agent, 'action_std', 0.0), 'note': ''}
+        self.fps, self.last_frame = 0.0, time.time()
+        self.log(f'run {self.run_id} · mode {mode} · {config}', 'INFO')
+        self.log(f'session log → {self.term.path}', 'INFO')
+
+    # ------------------------------------------------------------------ state
+    def log(self, text, level='INFO'):
+        self.term.log(text, level, self.sim_t)
+        self.term.scroll = 0 if self.term.scroll == 0 else self.term.scroll + 1  # stay where the user scrolled to
 
     def new_episode(self, env):
-        self.chase = ChaseCamera(env.vehicle)
-        self.bev = ChaseCamera(env.vehicle, BEV, carla.Transform(carla.Location(z=40.0), carla.Rotation(pitch=-90.0)), fov=70)
+        for name, (size, tr, fov, tick) in CAMS.items():
+            self.cams[name] = ChaseCamera(env.vehicle, size, tr, fov, tick)
+        self.rsu_cam, self.rsu_j = None, None
         bp = env.world.get_blueprint_library().find('sensor.other.collision')
         self.collision = env.world.spawn_actor(bp, carla.Transform(), attach_to=env.vehicle)
         self.hits = []
-        self.collision.listen(lambda e: self.hits.append(e.other_actor.type_id))  # read on the main thread in mark()
-        env.sensor_list += [self.chase.sensor, self.bev.sensor, self.collision]
+        self.collision.listen(lambda e: self.hits.append(e.other_actor.type_id))  # read on the main thread in after_step
+        env.sensor_list += [c.sensor for c in self.cams.values()] + [self.collision]
         self.episode += 1
         self.ep_reward = 0.0
         self.metrics.episodes += 1
         self.mark('episode', f'ep {self.episode}')
-        self.log(f'episode {self.episode}')
+        self.log(f'episode {self.episode} start · route {len(env.route_waypoints)} wp', 'INFO')
 
     def mark(self, kind, label=''):
         self.timeline = [e for e in self.timeline if e[0] > self.sim_t - 60] + [(self.sim_t, kind, label)]
 
-    def after_step(self, env):
-        '''Session metrics, timeline events and collisions for one simulation step.'''
+    def after_step(self, env, o, reward):
+        '''Per simulation step: telemetry series, policy outputs, session metrics, timeline events and collisions.'''
         self.sim_t += 0.05
+        with torch.no_grad():
+            x = o.cpu().unsqueeze(0)
+            self.mean = self.agent.old_policy.actor(x)[0].numpy()
+            self.value = float(self.agent.old_policy.critic(x)[0])
+        ctrl = env.vehicle.get_control()
+        yaw = env.vehicle.get_transform().rotation.yaw
+        if self.prev_yaw is not None:
+            self.yaw_rate = ((yaw - self.prev_yaw + 180) % 360 - 180) / 0.05
+        self.accel = 0.8 * self.accel + 0.2 * (env.velocity - self.prev_speed) / 3.6 / 0.05  # smoothed: physics jitter
+        self.prev_speed, self.prev_yaw = env.velocity, yaw
+        if env.timesteps % 2 == 0:  # every other step is enough for the conflict scan
+            near = conflicts(env)
+            hot = [(n[4], n[0].type_id.split('.')[-1]) for n in near if n[5] < 2.5 and 0 < n[4] < 3]
+            self.worst = min(hot) if hot else None
+        v2x = env.infra.channel.summary(env.infra.t) if env.infra else {'msg_per_s': 0, 'latency_ms': 0, 'loss': 0}
+        s = self.series
+        for k, v in (('t', self.sim_t), ('speed', env.velocity), ('target', env.target_speed), ('steer', ctrl.steer),
+                     ('throttle', ctrl.throttle), ('brake', ctrl.brake), ('reward', reward),
+                     ('front', min(env.front_obstacle, COOP_CORRIDOR)), ('ttc', self.worst[0] if self.worst else 3.0),
+                     ('msg', v2x['msg_per_s']), ('lat', v2x['latency_ms']), ('loss', 100 * v2x['loss']),
+                     ('value', self.value), ('pi_pedal', self.mean[1]), ('pi_steer', self.mean[0]),
+                     ('step_ms', self.ms['step']), ('vae_ms', self.ms['vae']), ('pi_ms', self.ms['policy']), ('draw_ms', self.ms['draw'])):
+            s[k].append(float(v))
+        if env.infra and env.timesteps % 20 == 1:
+            self.update_rsu_cam(env)
         w = env.infra.warning if env.infra else None
         if w and w['t'] - getattr(self, 'last_denm', -9) > 1.0:  # one mark per warning burst
             self.last_denm = w['t']
             self.mark('denm', w['kind'])
+            self.log(f"DENM {w['kind']} from {w['from']}", 'EVT')
         for kind in self.metrics.step(env.velocity, env.front_obstacle, env.red_moving):
             self.mark(kind)
+            if kind == 'red_light':
+                self.log('red light passed while moving', 'WARN')
         if self.hits:
             what = self.hits[0].split('.')[-1]
             self.hits = []
             self.metrics.collisions += 1
             self.mark('collision', what)
-            self.log(f'collision with {what}')
+            self.log(f'collision with {what}', 'ERR')
             return True
         return False
 
+    def update_rsu_cam(self, env):
+        '''Fixed camera on the pole of the nearest RSU (within 90 m), aimed at the ego's approach.'''
+        e = env.vehicle.get_location()
+        near = min(env.infra.rsus, key=lambda r: math.hypot(r['xy'][0] - e.x, r['xy'][1] - e.y), default=None)
+        if near is None or math.hypot(near['xy'][0] - e.x, near['xy'][1] - e.y) > 90 or near['junction'] == self.rsu_j:
+            return
+        if self.rsu_cam and self.rsu_cam.sensor.is_alive:
+            if self.rsu_cam.sensor in env.sensor_list:
+                env.sensor_list.remove(self.rsu_cam.sensor)
+            self.rsu_cam.sensor.destroy()
+        yaw = math.degrees(math.atan2(e.y - near['xy'][1], e.x - near['xy'][0]))
+        tr = carla.Transform(carla.Location(near['xy'][0], near['xy'][1], near['ground'] + 7.0), carla.Rotation(pitch=-28.0, yaw=yaw))
+        self.rsu_cam, self.rsu_j = ChaseCamera(None, (640, 360), tr, 90, 0.1, env.world), near['junction']
+        env.sensor_list.append(self.rsu_cam.sensor)
+        self.log(f"RSU camera → junction {near['junction']}", 'SYS')
+
+    def sensitivity(self, env, o):
+        if self.sens_step != env.timesteps:
+            self.sens, self.sens_step = input_sensitivity(self.agent.old_policy.actor, o), env.timesteps
+        return self.sens
+
     def start_replay(self):
         if len(self.frames) < 5:
-            return self.log('nothing to replay yet')
+            return self.log('nothing to replay yet', 'WARN')
         self.replay, self.replay_i = list(self.frames), 0
-        self.log(f'replay {len(self.replay)} frames · Esc to stop')
+        self.log(f'replay {len(self.replay)} frames · Esc to stop', 'OUT')
 
     def save_gif(self, path=None):
         from PIL import Image
         if len(self.frames) < 5:
-            return self.log('nothing to save yet')
+            return self.log('nothing to save yet', 'WARN')
         os.makedirs('replays', exist_ok=True)
         path = path or os.path.join('replays', time.strftime('replay_%H%M%S.gif'))
-        imgs = [Image.frombytes('RGB', f.get_size(), pygame.image.tostring(f, 'RGB')).resize((480, 315))
+        imgs = [Image.frombytes('RGB', f.get_size(), pygame.image.tostring(f, 'RGB')).resize((560, 315))
                 for f in list(self.frames)[::2]]
         imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=100, loop=0)
-        self.log(f'saved {path}')
-
-    def log(self, text):
-        self.events = ([time.strftime('%H:%M:%S  ') + text] + self.events)[:5]
-
-    def text(self, s, pos, color=FG, font=None, bg=None):
-        self.screen.blit((font or self.font).render(s, True, color, bg), pos)
-
-    def panel(self, rect, title):
-        pygame.draw.rect(self.screen, PANEL, rect, border_radius=6)
-        self.text(title, (rect[0] + 8, rect[1] + 4), CYAN, self.big)
-        return rect[0] + 8, rect[1] + 26
-
-    def bar(self, x, y, w, value, label, color):
-        pygame.draw.rect(self.screen, (50, 50, 60), (x, y, w, 10))
-        zero, end = x + w / 2, x + w * (np.clip(value, -1, 1) + 1) / 2
-        pygame.draw.rect(self.screen, color, (min(zero, end), y, max(abs(end - zero), 2), 10))
-        self.text(f'{label} {value:+.2f}', (x + w + 6, y - 3), FG, self.small)
+        self.log(f'saved {path}', 'OUT')
 
     # ------------------------------------------------------------------ commands
     def run(self, env, line):
         parts = line.strip().lstrip('/').split()
         if not parts:
             return
+        self.term.command(line.strip(), self.sim_t)
         cmd, args = parts[0].lower(), parts[1:]
-        self.show_help = cmd == 'help'
+        out = lambda text, level='OUT': self.log(text, level)
         if cmd == 'help':
+            for c, d in HELP:
+                out(f'  {c:24} {d}')
             return
+        if cmd == 'page':
+            names = list(PAGES)
+            a = args[0].lower() if args else ''
+            name = names[int(a) - 1] if a.isdigit() and 1 <= int(a) <= len(names) else a
+            if name not in PAGES:
+                return out(f'pages: {" ".join(names)}', 'WARN')
+            self.page, self.focus = name, None
+            return out(f'page {name}')
+        if cmd == 'focus':
+            name = args[0].lower() if args else 'off'
+            if name != 'off' and name not in META:
+                return out(f'panels: {" ".join(META)}', 'WARN')
+            self.focus = None if name == 'off' else name
+            return out(f'focus {name}')
         if cmd == 'spawn' and args:
             name = args[0].lower()
             if name in SCENARIOS:
@@ -281,38 +435,40 @@ class Dashboard:
             elif name in EVENTS:
                 ok = bool(EVENTS[name](env))
             else:
-                return self.log(f'unknown event {name}')
+                return out(f'unknown event {name}', 'WARN')
             if ok:
                 self.mark('chaos', name)
-            return self.log(f'{name}' if ok else f'{name}: no free spot, try again')
+            return out(f'spawned {name}' if ok else f'{name}: no free spot, try again', 'OUT' if ok else 'WARN')
         if cmd == 'chaos':
             if not env.traffic:
-                return self.log('chaos needs --vn')
+                return out('chaos needs --vn', 'WARN')
             a = args[0].lower() if args else ''
             env.traffic.chaos = 0.0 if a == 'off' else 5.0 if a in ('on', '') else max(1.0, float(a)) if a.replace('.', '', 1).isdigit() else env.traffic.chaos
             env.traffic.next_event = env.traffic.ticks + int(env.traffic.chaos * 20)
-            return self.log(f'chaos {"off" if not env.traffic.chaos else f"~every {env.traffic.chaos:.0f} s"}')
+            return out(f'chaos {"off" if not env.traffic.chaos else f"~every {env.traffic.chaos:.0f} s"}')
         if cmd == 'density' and args and args[0].isdigit():
             if not env.traffic:
-                return self.log('density needs --vn')
-            return self.log(f'motorbikes {env.traffic.set_motorbikes(env, int(args[0]))}')
+                return out('density needs --vn', 'WARN')
+            return out(f'motorbikes {env.traffic.set_motorbikes(env, int(args[0]))}')
         if cmd == 'driver' and args and args[0] in ('expert', 'ppo'):
+            if self.mode != 'drive':
+                return out(f'driver is locked while in {self.mode} mode', 'WARN')
             if args[0] == 'ppo' and not self.policy_ok:
-                return self.log('no matching PPO model')
+                return out('no matching PPO model', 'WARN')
             self.driver = args[0]
-            return self.log(f'driver {self.driver}')
+            return out(f'driver {self.driver}')
         if cmd == 'weather' and args and args[0] in WEATHER:
             env.world.set_weather(getattr(carla.WeatherParameters, WEATHER[args[0]]))
-            return self.log(f'weather {args[0]}')
+            return out(f'weather {args[0]}')
         if cmd == 'pause':
             self.paused = not self.paused
-            return self.log('paused' if self.paused else 'resumed')
+            return out('paused' if self.paused else 'resumed')
         if cmd == 'reset':
             self.want_reset = True
-            return
+            return out('reset requested')
         if cmd == 'v2x':
             if not env.infra:
-                return self.log('v2x needs --infra')
+                return out('v2x needs --infra', 'WARN')
             ch, key = env.infra.channel, args[0].lower() if args else ''
             val = float(args[1]) if len(args) > 1 and args[1].replace('.', '', 1).isdigit() else None
             if key in ('on', 'off'):
@@ -328,68 +484,74 @@ class Dashboard:
             elif key in ('cars', 'bikes') and val is not None:  # share of vehicles fitted with V2X (send CAM)
                 setattr(env.infra, 'cam_' + key, min(val, 100) / 100)
                 env.infra.connected = {}
-            return self.log(f"v2x {'on' if env.infra.enabled else 'off'} · {ch.latency * 1000:.0f} ms · loss {ch.loss * 100:.0f}% · "
-                            f"range {ch.range:.0f} m · gps {env.infra.gps_sigma:.1f} m · fitted cars {env.infra.cam_cars * 100:.0f}% "
-                            f"bikes {env.infra.cam_bikes * 100:.0f}%")
+            return out(f"v2x {'on' if env.infra.enabled else 'off'} · {ch.latency * 1000:.0f} ms · loss {ch.loss * 100:.0f}% · "
+                       f"range {ch.range:.0f} m · gps {env.infra.gps_sigma:.1f} m · fitted cars {env.infra.cam_cars * 100:.0f}% "
+                       f"bikes {env.infra.cam_bikes * 100:.0f}%")
         if cmd == 'replay':
             return self.start_replay()
         if cmd == 'gif':
             return self.save_gif(args[0] if args else None)
-        if cmd == 'focus':
-            name = args[0].lower() if args else 'off'
-            if name != 'off' and name not in PANELS:
-                return self.log(f'panels: {" ".join(PANELS)}')
-            self.focus = None if name == 'off' else name
-            return self.log(f'focus {name}')
         if cmd == 'snapshot':
             path = args[0] if args else time.strftime('snapshot_%H%M%S.png')
             pygame.image.save(self.screen, path)
-            return self.log(f'saved {path}')
-        if cmd == 'clear':
-            self.events = []
+            return out(f'saved {path}')
+        if cmd == 'stats':
+            m = self.metrics.summary()
+            return out(f"distance {m['km'] * 1000:.0f} m · collisions/km {m['collisions_per_km']:.2f} · near-miss s/km "
+                       f"{m['near_miss_s_per_km']:.1f} · red/km {m['red_runs_per_km']:.2f} · mean {m['mean_speed']:.1f} km/h · "
+                       f"episodes {self.metrics.episodes}")
+        if cmd == 'history':
+            for k, h in enumerate(self.term.history[-20:]):
+                out(f'  {k + 1:3d}  {h}')
             return
+        if cmd == 'log':
+            return out(f'{os.path.abspath(self.term.path)} · {len(self.term.lines)} lines in view')
+        if cmd in ('cls', 'clear'):
+            return self.term.clear()
         if cmd in ('quit', 'exit'):
             self.quit = True
             return
-        self.log(f'unknown: /{" ".join(parts)}  (/help)')
+        out(f"unknown command '{cmd}' · type help", 'WARN')
 
     def complete(self, line):
         '''Tab: complete the command, then its argument; several matches -> longest common prefix.'''
+        slash = '/' if line.startswith('/') else ''
         parts = line.lstrip('/').split(' ')
-        if len(parts) == 1:
-            options, word = [c.split()[0].lstrip('/') for c, _ in HELP if c.startswith('/')], parts[0]
-        else:
-            options, word = COMPLETE.get(parts[0], []), parts[-1]
+        options, word = (COMMANDS, parts[0]) if len(parts) == 1 else (COMPLETE.get(parts[0], []), parts[-1])
         hits = [o for o in options if o.startswith(word)]
         if not hits:
             return line
-        done = os.path.commonprefix(hits) + (' ' if len(hits) == 1 else '')
         if len(hits) > 1:
-            self.log('  '.join(hits))
-        return '/' + ' '.join(parts[:-1] + [done])
+            self.log('  '.join(hits), 'OUT')
+        return slash + ' '.join(parts[:-1] + [os.path.commonprefix(hits) + (' ' if len(hits) == 1 else '')])
 
     def handle_events(self, env):
+        rows = self.term_rows()
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
                 self.quit = True
             elif e.type == pygame.VIDEORESIZE:
                 self.window = pygame.display.set_mode(e.size, pygame.RESIZABLE)
-            elif e.type == pygame.KEYDOWN and not self.typing:
-                if e.key in (pygame.K_SLASH, pygame.K_RETURN, pygame.K_KP_DIVIDE):
-                    self.typing, self.line, self.hist_i = True, '/', len(self.history)
-                elif e.key == pygame.K_ESCAPE:
-                    self.show_help, self.replay = False, None
+            elif e.type == pygame.MOUSEWHEEL:
+                self.term.scroll += 3 * e.y
             elif e.type == pygame.KEYDOWN:
-                if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                    self.typing = False
-                    if self.line.strip('/ '):
-                        self.history = [h for h in self.history if h != self.line] + [self.line]
-                    self.run(env, self.line)
+                if pygame.K_F1 <= e.key <= pygame.K_F5:
+                    self.page, self.focus = list(PAGES)[e.key - pygame.K_F1], None
+                elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    line, self.line = self.line, ''
+                    self.term.scroll = 0
+                    self.run(env, line)
+                    self.hist_i = len(self.term.history)
                 elif e.key == pygame.K_ESCAPE:
-                    self.typing, self.line = False, ''
-                elif e.key in (pygame.K_UP, pygame.K_DOWN) and self.history:
-                    self.hist_i = max(0, min(len(self.history), self.hist_i + (-1 if e.key == pygame.K_UP else 1)))
-                    self.line = self.history[self.hist_i] if self.hist_i < len(self.history) else '/'
+                    self.line, self.replay = '', None
+                elif e.key in (pygame.K_UP, pygame.K_DOWN) and self.term.history:
+                    hist = self.term.history
+                    self.hist_i = max(0, min(len(hist), self.hist_i + (-1 if e.key == pygame.K_UP else 1)))
+                    self.line = hist[self.hist_i] if self.hist_i < len(hist) else ''
+                elif e.key == pygame.K_PAGEUP:
+                    self.term.scroll += rows - 1
+                elif e.key == pygame.K_PAGEDOWN:
+                    self.term.scroll = max(0, self.term.scroll - rows + 1)
                 elif e.key == pygame.K_TAB:
                     self.line = self.complete(self.line)
                 elif e.key == pygame.K_BACKSPACE:
@@ -398,12 +560,512 @@ class Dashboard:
                     self.line += e.unicode
         if env.traffic and env.traffic.log:  # surprise events fired by the chaos timer
             for name in env.traffic.log:
-                self.log(f'chaos: {name}')
+                self.log(f'chaos event: {name}', 'EVT')
                 self.mark('chaos', name)
             env.traffic.log.clear()
 
-    # ------------------------------------------------------------------ drawing
-    def draw(self, env, obs, action, reward):
+    # ------------------------------------------------------------------ drawing helpers
+    def text(self, s, msg, pos, color=FG, font=None, right=False):
+        img = (font or self.mono).render(msg, True, color)
+        s.blit(img, (pos[0] - img.get_width(), pos[1]) if right else pos)
+        return img.get_width()
+
+    def led(self, s, pos, color):
+        pygame.draw.circle(s, color, pos, 4)
+        pygame.draw.circle(s, tuple(min(255, c + 60) for c in color), (pos[0] - 1, pos[1] - 1), 1)
+
+    def frame(self, name, rect):
+        '''Panel chrome (border, header strip with tag + title); returns the content subsurface.'''
+        x, y, w, h = rect
+        s = self.screen
+        pygame.draw.rect(s, PANEL, rect)
+        pygame.draw.rect(s, EDGE, rect, 1)
+        pygame.draw.rect(s, HEADC, (x + 1, y + 1, w - 2, 17))
+        tag, title = META[name]
+        tw = self.text(s, tag, (x + 6, y + 2), CYAN, self.bold)
+        self.text(s, title, (x + 14 + tw, y + 3), FG, self.small)
+        return s.subsurface((x + 1, y + 19, w - 2, h - 20))
+
+    def cover(self, s, frame, flip=False):
+        '''Blit a camera frame scaled to cover s (center crop). Returns the scale factor.'''
+        w, h = s.get_size()
+        img = pygame.surfarray.make_surface(frame)
+        k = max(w / img.get_width(), h / img.get_height())
+        img = pygame.transform.scale(img, (int(img.get_width() * k + 1), int(img.get_height() * k + 1)))
+        if flip:
+            img = pygame.transform.flip(img, True, False)
+        s.blit(img, ((w - img.get_width()) // 2, (h - img.get_height()) // 2))
+        return k
+
+    def caption(self, s, msg):
+        '''Small readout in the bottom-left corner of an image panel, on a dark plate so it reads on any picture.'''
+        img = self.small.render(msg, True, CYAN)
+        y = s.get_height() - img.get_height() - 6
+        pygame.draw.rect(s, (6, 8, 11), (6, y - 2, img.get_width() + 8, img.get_height() + 4))
+        s.blit(img, (10, y))
+
+    def reticle(self, s):
+        w, h = s.get_size()
+        for (cx, cy), (dx, dy) in (((8, 8), (1, 1)), ((w - 9, 8), (-1, 1)), ((8, h - 9), (1, -1)), ((w - 9, h - 9), (-1, -1))):
+            pygame.draw.line(s, CYAN, (cx, cy), (cx + 12 * dx, cy), 1)
+            pygame.draw.line(s, CYAN, (cx, cy), (cx, cy + 12 * dy), 1)
+
+    def hbar(self, s, x, y, w, value, label, color, lo=-1.0):
+        '''Horizontal gauge from lo..1 (zero line drawn when lo < 0).'''
+        pygame.draw.rect(s, GRID, (x, y, w, 9))
+        value = float(np.clip(value, lo, 1))
+        zero = x + w * (-lo) / (1 - lo)
+        end = x + w * (value - lo) / (1 - lo)
+        pygame.draw.rect(s, color, (min(zero, end), y, max(abs(end - zero), 2), 9))
+        if lo < 0:
+            pygame.draw.line(s, DIM, (zero, y - 2), (zero, y + 10))
+        self.text(s, f'{label:9}{value:+.3f}', (x + w + 8, y - 2), FG, self.small)
+
+    def chart(self, s, keys, colors, names, unit='', lo=None, hi=None, window=30.0):
+        '''Time series of the last `window` s with nice y ticks, x grid every 5 s and a legend with current values.'''
+        w, h = s.get_size()
+        L, R, T, B = 46, 10, 20, 18
+        pw, ph = w - L - R, h - T - B
+        t = np.array(self.series['t'])
+        pygame.draw.rect(s, (10, 12, 17), (L, T, pw, ph))
+        if len(t) < 2:
+            self.text(s, 'awaiting samples…', (L + 8, T + 8), DIM, self.small)
+            return
+        keep = t > t[-1] - window
+        data = [np.array(self.series[k])[keep] for k in keys]
+        vals = np.concatenate(data)
+        ticks = nice_ticks(vals.min() if lo is None else lo, vals.max() if hi is None else hi)
+        y0, y1 = ticks[0], ticks[-1]
+        ypx = lambda v: T + ph * (1 - (np.clip(v, y0, y1) - y0) / (y1 - y0))
+        for v in ticks:
+            pygame.draw.line(s, GRID, (L, ypx(v)), (L + pw, ypx(v)))
+            self.text(s, f'{v:g}', (L - 5, ypx(v) - 6), DIM, self.small, right=True)
+        for sec in range(0, int(window) + 1, 5):
+            px = L + pw * (1 - sec / window)
+            pygame.draw.line(s, GRID, (px, T), (px, T + ph))
+            self.text(s, f'-{sec}s' if sec else 't0', (px - 10, T + ph + 3), DIM, self.small)
+        if y0 < 0 < y1:
+            pygame.draw.line(s, DIM, (L, ypx(0)), (L + pw, ypx(0)))
+        xs = L + pw * (1 - (t[-1] - t[keep]) / window)
+        x = L + 4
+        for d, c, n in zip(data, colors, names):
+            if len(d) > 1:
+                pygame.draw.lines(s, c, False, list(zip(xs, ypx(d))), 1)
+            pygame.draw.rect(s, c, (x, 6, 8, 8))
+            x += 12 + self.text(s, f'{n} {d[-1]:.2f}{unit}', (x + 12, 3), c, self.small) + 10
+        pygame.draw.rect(s, EDGE, (L, T, pw, ph), 1)
+
+    # ------------------------------------------------------------------ panels (draw into the content surface s)
+    def p_camera(self, name):
+        def draw(s, env, o):
+            cam = self.rsu_cam if name == 'rsu' else self.cams.get(name)
+            if cam is None or cam.frame is None:
+                self.text(s, 'NO SIGNAL' if name != 'rsu' else 'no RSU within 90 m' if env.infra else 'RSUs need --infra',
+                          (s.get_width() // 2 - 60, s.get_height() // 2 - 8), DIM, self.bold)
+                return 'offline'
+            self.cover(s, cam.frame, flip=name.startswith('mirror'))
+            self.reticle(s)
+            age = (self.sim_now - cam.ts) * 1000 if cam.ts else 0
+            self.caption(s, f'{cam.size[0]}×{cam.size[1]}  {1 / cam.tick if cam.tick else 20:.0f} Hz  #{cam.n}  age {age:.0f} ms')
+            if name == 'chase':
+                self.text(s, f'{env.velocity:5.1f} km/h', (s.get_width() - 12, 12), FG, self.large, right=True)
+            return 'live'
+        return draw
+
+    def p_bev(self, s, env, o):
+        cam = self.cams.get('bev')
+        w, h = s.get_size()
+        mx, my = w // 2, h // 2
+        k = self.cover(s, cam.frame) if cam and cam.frame is not None else 1.0
+        scale = k * BEV[0] / BEV_M
+        t, rot = ego_frame(env)
+
+        def px(dx, dy):
+            f, r = rot(dx, dy)
+            return mx + r * scale, my - f * scale
+        route = [px(wp.transform.location.x - t.location.x, wp.transform.location.y - t.location.y)
+                 for wp in env.route_waypoints[env.current_waypoint_index::2][:40]]
+        if len(route) > 1:
+            pygame.draw.lines(s, (120, 120, 170), False, route, 2)
+        near = conflicts(env)
+        for a, p, va, vr, ttc, dist in near:
+            danger = dist < 2.5 and 0 < ttc < 3
+            u = (mx + p[1] * scale, my - p[0] * scale)
+            col = RED if danger else YELLOW if a.type_id.startswith('walker') else ORANGE if a.type_id in MOTORBIKES + BICYCLES else CYAN
+            if math.hypot(*va) > 0.5:  # where it will be in 2 s
+                pygame.draw.line(s, col, u, (mx + (p[1] + 2 * va[1]) * scale, my - (p[0] + 2 * va[0]) * scale), 2)
+            pygame.draw.circle(s, col, (int(u[0]), int(u[1])), 6 if danger else 3, 2 if danger else 0)
+            if danger:
+                pygame.draw.circle(s, RED, (int(mx + (p[1] + vr[1] * ttc) * scale), int(my - (p[0] + vr[0] * ttc) * scale)), 4)
+        if env.infra:
+            for r in env.infra.rsus:
+                u = px(r['xy'][0] - t.location.x, r['xy'][1] - t.location.y)
+                pygame.draw.rect(s, YELLOW, (u[0] - 5, u[1] - 5, 10, 10), 2)
+            for ob in env.infra.known.values():
+                age = env.infra.t - ob['t']
+                u = px(ob['x'] + ob['vx'] * age - t.location.x, ob['y'] + ob['vy'] * age - t.location.y)
+                pygame.draw.rect(s, (120, 255, 255), (u[0] - 4, u[1] - 4, 8, 8), 1)
+            if env.infra.warning_now() is not None:
+                wn = env.infra.warning
+                cx, cy = px(wn['x'] - t.location.x, wn['y'] - t.location.y)
+                pygame.draw.line(s, RED, (cx - 7, cy - 7), (cx + 7, cy + 7), 3)
+                pygame.draw.line(s, RED, (cx - 7, cy + 7), (cx + 7, cy - 7), 3)
+        pygame.draw.polygon(s, FG, [(mx, my - 8), (mx - 5, my + 6), (mx + 5, my + 6)])
+        for m in (10, 20):  # range rings
+            pygame.draw.circle(s, GRID, (mx, my), int(m * scale), 1)
+            self.text(s, f'{m} m', (mx + int(m * scale) - 26, my + 2), DIM, self.small)
+        return f'{len(near)} users <30 m'
+
+    def p_lidar(self, s, env, o):
+        scans = [l.latest for l in env.lidar_objs if l.latest is not None]
+        n_cars = len(scans)
+        if env.infra:
+            scans += [r['lidar'].latest for r in env.infra.rsus if r['lidar'].latest is not None]
+        img, marks = lidar_render([sc[0] for sc in scans], [sc[1] for sc in scans], env.lidar_objs[0].latest[1], s.get_size())
+        s.blit(pygame.surfarray.make_surface(img), (0, 0))
+        for u, v, i in marks:
+            if i >= n_cars:
+                pygame.draw.rect(s, YELLOW, (u - 5, v - 5, 10, 10), 2)
+            else:
+                pygame.draw.circle(s, (255, 255, 255) if i == 0 else CYAN, (u, v), 6 if i == 0 else 4, 2)
+        pts = sum(len(sc[0]) for sc in scans)
+        self.caption(s, f'○ ego  ○ coop car  □ RSU      {pts:,} pts fused')
+        return f'{n_cars} veh + {len(scans) - n_cars} RSU'
+
+    def p_semseg(self, s, env, o):
+        sem = env.image_obs.reshape(80, 160, 3)[:, :, ::-1]  # buffer order is H x W, BGR
+        w, h = s.get_size()
+        s.blit(pygame.transform.scale(pygame.surfarray.make_surface(sem.swapaxes(0, 1).copy()), (w - 16, (w - 16) // 2)), (8, 8))
+        self.text(s, 'semantic segmentation · fov 90 · 160×80 → VAE encoder', (8, (w - 16) // 2 + 14), DIM, self.small)
+        self.text(s, f'encode {self.ms["vae"]:.1f} ms', (8, (w - 16) // 2 + 30), CYAN, self.small)
+        return 'obs[0:95]'
+
+    def p_vae(self, s, env, o):
+        w, h = s.get_size()
+        with torch.no_grad():
+            rec = self.decoder(o[:LATENT_DIM].unsqueeze(0).to(next(self.decoder.parameters()).device))[0]
+        recimg = (rec.permute(2, 1, 0).cpu().numpy() * 255).astype(np.uint8)
+        s.blit(pygame.transform.scale(pygame.surfarray.make_surface(recimg), (w - 16, (w - 16) // 2)), (8, 8))
+        z = o[:LATENT_DIM].cpu().numpy()
+        y0, bw = (w - 16) // 2 + 18, (w - 16) / LATENT_DIM
+        mid = y0 + 40
+        pygame.draw.line(s, GRID, (8, mid), (w - 8, mid))
+        for k, val in enumerate(z):
+            hgt = float(np.clip(val, -3, 3)) * 12
+            pygame.draw.rect(s, CYAN if val >= 0 else MAG, (8 + k * bw, min(mid, mid - hgt), max(bw - 1, 1), abs(hgt) + 1))
+        self.text(s, f'z ∈ R^{LATENT_DIM}   μ {z.mean():+.2f}   σ {z.std():.2f}   |z|max {abs(z).max():.2f}', (8, mid + 42), DIM, self.small)
+        return 'decoder'
+
+    def p_radar(self, s, env, o):
+        w, h = s.get_size()
+        sectors = o[100:100 + COOP_SECTORS].cpu().numpy()
+        cx, cy, r = w // 2, h // 2 + 4, min(w, h) // 2 - 26
+        n = len(sectors)
+        for ring in (0.25, 0.5, 0.75, 1.0):
+            pygame.draw.circle(s, GRID, (cx, cy), int(12 + (r - 12) * ring), 1)
+        for k in range(n):
+            a0, a1 = -math.pi + k * 2 * math.pi / n, -math.pi + (k + 1) * 2 * math.pi / n
+            rr = 12 + (r - 12) * sectors[k]
+            col = RED if sectors[k] < .15 else ORANGE if sectors[k] < .4 else GREEN
+            pygame.draw.polygon(s, col, [(cx, cy)] + [(cx + rr * math.sin(a), cy - rr * math.cos(a)) for a in np.linspace(a0, a1, 4)])
+        pygame.draw.polygon(s, FG, [(cx, cy - 9), (cx - 5, cy + 6), (cx + 5, cy + 6)])
+        # outer ring: how much each direction drives the pedal right now (now + motion features of that sector)
+        _, pedal_s = self.sensitivity(env, o)
+        c0 = LATENT_DIM + 5
+        sect = pedal_s[c0:c0 + n] + pedal_s[c0 + n + 1:c0 + 2 * n + 1]
+        top = sect.max() or 1.0
+        for k in range(n):
+            a0, a1 = -math.pi + k * 2 * math.pi / n, -math.pi + (k + 1) * 2 * math.pi / n
+            wk = sect[k] / top
+            if wk > 0.5:  # only the directions that clearly dominate the decision
+                pts = [(cx + (r + 6) * math.sin(a), cy - (r + 6) * math.cos(a)) for a in np.linspace(a0, a1, 5)]
+                pygame.draw.lines(s, (int(70 + 185 * wk), int(200 * wk), 255), False, pts, int(2 + 6 * wk))
+        self.text(s, f'{n} sectors · {COOP_VEHICLES} coop · range 50 m', (6, 4), DIM, self.small)
+        self.text(s, 'outer arc: ∂π_pedal/∂sector', (6, h - 16), (120, 160, 255), self.small)
+        return f'min {50 * sectors.min():.1f} m'
+
+    def p_policy(self, s, env, o):
+        steer_s, pedal_s = self.sensitivity(env, o)
+        self.text(s, f"driver {self.driver.upper()}   mode {self.mode.upper()}   σ_action {getattr(self.agent, 'action_std', 0):.3f}",
+                  (10, 6), CYAN if self.policy_ok else ORANGE, self.mono)
+        self.hbar(s, 10, 32, 200, self.mean[0], 'μ steer', ORANGE)
+        self.hbar(s, 10, 50, 200, self.mean[1], 'μ pedal', GREEN)
+        self.hbar(s, 10, 68, 200, np.tanh(self.value / 10), 'V(s)/10', CYAN)
+        self.text(s, f'V(s) {self.value:+.3f}   obs dim {100 + COOP_OBS}   actor ∂ via autograd', (10, 86), DIM, self.small)
+        groups = group_sensitivity(pedal_s, LATENT_DIM, COOP_SECTORS)
+        total = sum(groups.values()) or 1.0
+        verb = 'BRAKE' if self.mean[1] < -0.05 else 'ACCEL' if self.mean[1] > 0.05 else 'HOLD'
+        self.text(s, f'pedal attribution → {verb}', (10, 108), FG, self.bold)
+        for k, (name, val) in enumerate(sorted(groups.items(), key=lambda kv: -kv[1])[:9]):
+            y = 130 + k * 16
+            pygame.draw.rect(s, GRID, (10, y, 220, 9))
+            pygame.draw.rect(s, GREEN if k < 3 else (60, 140, 90), (10, y, int(220 * val / total), 9))
+            self.text(s, f'{100 * val / total:5.1f}%  {name}', (240, y - 3), FG if k < 3 else DIM, self.small)
+        return 'loaded' if self.policy_ok else 'no model'
+
+    def p_reward(self, s, env, o):
+        centering = max(1 - env.distance_from_center / env.max_distance_from_center, 0)
+        angle_f = max(1 - abs(env.angle / np.deg2rad(20)), 0)
+        r = self.series['reward'][-1] if self.series['reward'] else 0.0
+        rows = [('speed', f'{env.velocity:6.2f} km/h', f'band [{env.min_speed:.0f}, {env.target_speed:.0f}] max {env.max_speed:.0f}'),
+                ('centering', f'{env.distance_from_center:6.2f} m', f'factor ×{centering:.3f}'),
+                ('heading', f'{math.degrees(env.angle):+6.2f} °', f'factor ×{angle_f:.3f}'),
+                ('front gap', f'{min(env.front_obstacle, 99):6.2f} m', 'lane corridor (coop LiDAR)'),
+                ('red & moving', f'{"YES" if env.red_moving else "no":>6}', 'safety penalty term'),
+                ('step reward', f'{r:+6.3f}', f'episode Σ {self.ep_reward:+.1f}'),
+                ('waypoint', f'{env.current_waypoint_index:6d}', f'of {len(env.route_waypoints)}')]
+        for k, (a, b, c) in enumerate(rows):
+            col = (GREEN if r > 0 else RED) if a == 'step reward' else RED if a == 'red & moving' and env.red_moving else FG
+            self.text(s, f'{a:13}', (10, 8 + k * 19), DIM, self.mono)
+            self.text(s, b, (130, 8 + k * 19), col, self.mono)
+            self.text(s, c, (230, 10 + k * 19), DIM, self.small)
+        flags = [('collision', bool(env.collision_history)), (f'off-lane > {env.max_distance_from_center:.0f} m', env.distance_from_center > env.max_distance_from_center),
+                 (f'speed > {env.max_speed:.0f}', env.velocity > env.max_speed), ('route complete', env.current_waypoint_index >= len(env.route_waypoints) - 2)]
+        self.text(s, 'termination', (10, 150), FG, self.bold)
+        for k, (name, on) in enumerate(flags):
+            self.led(s, (16 + (k % 2) * 230, 178 + (k // 2) * 20), RED if on else (40, 60, 50))
+            self.text(s, name, (28 + (k % 2) * 230, 171 + (k // 2) * 20), RED if on else DIM, self.small)
+        return f'Σ {self.ep_reward:+.0f}'
+
+    def p_train(self, s, env, o):
+        tr = self.train
+        el = time.time() - tr['start']
+        rate = (tr['timestep'] - tr['steps0']) / el if el > 1 else 0.0
+        eta = (tr['target'] - tr['timestep']) / rate if rate > 0 and tr['target'] else 0
+        frac = tr['timestep'] / tr['target'] if tr['target'] else 0
+        self.text(s, f'MODE  {self.mode.upper()}', (10, 6), CYAN, self.large)
+        pygame.draw.rect(s, GRID, (10, 40, s.get_width() - 20, 12))
+        pygame.draw.rect(s, GREEN, (10, 40, int((s.get_width() - 20) * min(frac, 1)), 12))
+        self.text(s, f'{100 * frac:5.1f} %', (s.get_width() - 12, 56), FG, self.small, right=True)
+        mem = len(self.agent.memory.rewards) if self.mode == 'train' else 0
+        rows = [('timestep', f"{tr['timestep']:,} / {tr['target']:,}" if tr['target'] else f"{tr['timestep']:,}"),
+                ('episode', f"{tr['episode']}  (this session {self.episode})"),
+                ('avg return', f"{tr['avg']:+.2f}"), ('last return', f"{self.ep_hist[-1]:+.2f}" if self.ep_hist else '-'),
+                ('action σ', f"{tr['std']:.3f}"), ('rollout buffer', f'{mem:,} steps'),
+                ('PPO updates', f"{tr['updates']}  (last {tr['update_s']:.1f} s)"), ('checkpoints', f"{tr['saves']} saved"),
+                ('throughput', f'{rate:.1f} steps/s   RTF {rate * 0.05:.2f}×'),
+                ('elapsed · ETA', f'{el / 60:.1f} min · {eta / 60:.0f} min' if eta else f'{el / 60:.1f} min'),
+                ('note', tr['note'] or '-')]
+        for k, (a, b) in enumerate(rows):
+            self.text(s, f'{a:15}', (10, 72 + k * 18), DIM, self.mono)
+            self.text(s, b, (150, 72 + k * 18), FG, self.mono)
+        return self.mode
+
+    def p_v2x(self, s, env, o):
+        if not env.infra:
+            self.text(s, 'infrastructure disabled · start with --infra', (10, 10), DIM, self.mono)
+            return 'off'
+        inf, ch = env.infra, env.infra.channel
+        v = ch.summary(inf.t)
+        e = env.vehicle.get_location()
+        self.led(s, (16, 14), GREEN if inf.enabled else RED)
+        self.text(s, f"{'ONLINE' if inf.enabled else 'OFFLINE'}  {v['msg_per_s']:5.0f} msg/s  {v['latency_ms']:4.0f} ms  loss {100 * v['loss']:3.0f}%",
+                  (28, 7), FG, self.mono)
+        self.text(s, f'cfg latency {ch.latency * 1000:.0f}±{ch.jitter * 1000:.0f} ms · loss {ch.loss * 100:.0f}% · range {ch.range:.0f} m · '
+                     f'gps σ {inf.gps_sigma:.1f} m', (10, 28), DIM, self.small)
+        self.text(s, f'fitted CAM: cars {inf.cam_cars * 100:.0f}% · bikes {inf.cam_bikes * 100:.0f}%', (10, 42), DIM, self.small)
+        src = collections.Counter(ob.get('src', '?') for ob in inf.known.values())
+        self.text(s, f"known objects {len(inf.known)}  " + '  '.join(f'{k} {n}' for k, n in sorted(src.items())), (10, 60), CYAN, self.mono)
+        la = inf.light_ahead
+        self.text(s, f'SPaT  {la[1].upper()} · {la[2]:.1f} s left · {la[0]:.0f} m' if la else 'SPaT  no light on route',
+                  (10, 78), RED if la and la[1] == 'Red' else YELLOW if la else DIM, self.mono)
+        denm = inf.warning_now()
+        self.text(s, f"DENM  {inf.warning['kind']} · meets ego in {denm:.1f} s · {inf.warning['from']}" if denm is not None else 'DENM  idle',
+                  (10, 96), RED if denm is not None else DIM, self.mono)
+        self.text(s, f"{'RSU':6}{'junction':>9}{'dist m':>9}{'pts':>8}", (10, 120), DIM, self.small)
+        rs = sorted(inf.rsus, key=lambda r: math.hypot(r['xy'][0] - e.x, r['xy'][1] - e.y))
+        for k, r in enumerate(rs[:8]):
+            d = math.hypot(r['xy'][0] - e.x, r['xy'][1] - e.y)
+            pts = len(r['lidar'].latest[0]) if r['lidar'].latest is not None else 0
+            self.led(s, (14, 140 + k * 15), GREEN if d < ch.range else (50, 60, 70))
+            self.text(s, f"RSU-{k:<2}{r['junction']:>9}{d:9.0f}{pts:8,}", (22, 134 + k * 15), FG if d < 80 else DIM, self.small)
+        return f'{len(inf.rsus)} RSU'
+
+    def p_readout(self, s, env, o):
+        ctrl = env.vehicle.get_control()
+        loc = env.vehicle.get_location()
+        cells = [('SPEED', f'{env.velocity:5.1f}', 'km/h', FG), ('ACCEL', f'{self.accel:+5.2f}', 'm/s²', FG),
+                 ('YAW RATE', f'{self.yaw_rate:+5.1f}', '°/s', FG), ('STEER', f'{ctrl.steer:+.3f}', '', ORANGE),
+                 ('THROTTLE', f'{ctrl.throttle:.3f}', '', GREEN), ('BRAKE', f'{ctrl.brake:.3f}', '', RED if ctrl.brake > 0 else FG),
+                 ('LANE OFF', f'{env.distance_from_center:4.2f}', 'm', FG), ('FRONT GAP', f'{min(env.front_obstacle, 99):4.1f}', 'm', FG),
+                 ('MIN TTC', f'{self.worst[0]:.1f}' if self.worst else ' --', 's', RED if self.worst else DIM)]
+        cw = (s.get_width() - 12) // 3
+        for k, (lab, val, unit, col) in enumerate(cells):
+            x, y = 6 + (k % 3) * cw, 4 + (k // 3) * 58
+            pygame.draw.rect(s, (10, 12, 17), (x, y, cw - 6, 54))
+            pygame.draw.rect(s, GRID, (x, y, cw - 6, 54), 1)
+            self.text(s, lab, (x + 6, y + 3), DIM, self.small)
+            vw = self.text(s, val, (x + 6, y + 20), col, self.large)
+            self.text(s, unit, (x + 10 + vw, y + 30), DIM, self.small)
+        self.text(s, f'GNSS x {loc.x:8.2f}  y {loc.y:8.2f}  z {loc.z:5.2f}   yaw {env.vehicle.get_transform().rotation.yaw:+7.1f}°',
+                  (8, s.get_height() - 16), DIM, self.small)
+        return f'{env.timesteps} steps'
+
+    def p_situations(self, s, env, o):
+        denm = env.infra.warning_now() if env.infra else None
+        labels = ([(f"DENM {env.infra.warning['kind']} meets ego in {denm:.1f} s ({env.infra.warning['from']})", RED)] if denm is not None else []) \
+            + ([(f'Conflict in {self.worst[0]:.1f} s: {self.worst[1]}', RED)] if self.worst else []) + detect_situations(env)
+        for k, (label, col) in enumerate(labels[:10]):
+            self.led(s, (14, 14 + k * 19), col)
+            self.text(s, label, (26, 7 + k * 19), col, self.mono)
+        sev = 'HIGH' if any(c == RED for _, c in labels) else 'MED' if any(c == ORANGE for _, c in labels) else 'LOW'
+        return f'risk {sev}'
+
+    def p_sensors(self, s, env, o):
+        self.text(s, f"{'ID':10}{'TYPE':14}{'MOUNT':16}{'CONFIG':22}{'RATE':>8}{'OUTPUT':>14}{'AGE ms':>9}", (24, 4), DIM, self.small)
+        rows = [('CAM-00', 'semantic', 'ego roof', '160×80 fov 90', '20 Hz', 'obs', 0 if env.image_obs is not None else None)]
+        for k, name in enumerate(CAMS):
+            c = self.cams.get(name)
+            if c:
+                rows.append((META[name][0], 'rgb', name, f'{c.size[0]}×{c.size[1]}', f'{1 / c.tick if c.tick else 20:.0f} Hz', f'#{c.n}',
+                             (self.sim_now - c.ts) * 1000 if c.ts else None))
+        if self.rsu_cam:
+            c = self.rsu_cam
+            rows.append(('CAM-07', 'rgb', f'pole J{self.rsu_j}', '640×360', '10 Hz', f'#{c.n}', (self.sim_now - c.ts) * 1000 if c.ts else None))
+        for k, l in enumerate(env.lidar_objs):
+            rows.append((f'LDR-{k:02d}', 'lidar ray', 'ego roof' if k == 0 else f'coop car {k}', f'{LIDAR_CHANNELS} ch {LIDAR_POINTS_PER_SECOND // 1000}k/s',
+                         '20 Hz', f'{len(l.latest[0]):,} pts' if l.latest is not None else '-', 0 if l.latest is not None else None))
+        if env.infra:
+            for k, r in enumerate(env.infra.rsus):
+                rows.append((f'RSU-{k:02d}', 'lidar ray', f"pole J{r['junction']}", '64 ch 200k/s', '20 Hz',
+                             f"{len(r['lidar'].latest[0]):,} pts" if r['lidar'].latest is not None else '-', 0 if r['lidar'].latest is not None else None))
+        rows.append(('COL-00', 'collision', 'ego', 'event', 'async', f'{self.metrics.collisions} hits', 0))
+        lh = max(10, min(14, (s.get_height() - 22) // max(1, len(rows))))
+        for k, (i, typ, mount, cfg, rate, outp, age) in enumerate(rows):
+            y = 20 + k * lh
+            ok = age is not None and age < 400
+            self.led(s, (12, y + 6), GREEN if ok else ORANGE if age is not None else RED)
+            self.text(s, f'{i:10}{typ:14}{mount:16}{cfg:22}{rate:>8}{outp:>14}{(f"{age:.0f}" if age is not None else "--"):>9}',
+                      (24, y), FG if ok else DIM, self.small)
+        return f'{len(rows)} devices'
+
+    def p_metrics(self, s, env, o):
+        m = self.metrics.summary()
+        rows = [('distance', f"{m['km'] * 1000:,.0f} m"), ('collisions', f"{self.metrics.collisions}  ({m['collisions_per_km']:.2f}/km)"),
+                ('near-miss', f"{m['near_miss_s_per_km']:.1f} s/km"), ('red-light runs', f"{self.metrics.red_runs}  ({m['red_runs_per_km']:.2f}/km)"),
+                ('mean speed', f"{m['mean_speed']:.1f} km/h"), ('episodes', f'{self.metrics.episodes}')]
+        for k, (a, b) in enumerate(rows):
+            self.text(s, f'{a:15}', (10, 6 + k * 18), DIM, self.mono)
+            self.text(s, b, (150, 6 + k * 18), FG, self.mono)
+        w, h = s.get_size()
+        tx0, tx1, ty = 14, w - 14, h - 34
+        pygame.draw.line(s, DIM, (tx0, ty), (tx1, ty), 1)
+        for sec in range(0, 61, 10):
+            px = tx1 - (tx1 - tx0) * sec / 60
+            pygame.draw.line(s, DIM, (px, ty - 3), (px, ty + 3), 1)
+            self.text(s, f'-{sec}s' if sec else 'now', (px - 10, ty + 6), DIM, self.small)
+        styles = {'denm': (RED, 10), 'chaos': (MAG, 9), 'near_miss': (ORANGE, 5), 'red_light': (YELLOW, 7), 'collision': (RED, 14), 'episode': (FG, 18)}
+        for k, (ts, kind, label) in enumerate(self.timeline):
+            px = tx1 - (tx1 - tx0) * (self.sim_t - ts) / 60
+            col, hgt = styles.get(kind, (DIM, 5))
+            pygame.draw.line(s, col, (px, ty - hgt), (px, ty), 3 if kind == 'collision' else 1)
+            if label and kind != 'near_miss':
+                self.text(s, label, (px - 4, ty - hgt - 13 - 12 * (k % 3)), col, self.small)
+        return f"{m['km'] * 1000:.0f} m"
+
+    def p_episodes(self, s, env, o):
+        w, h = s.get_size()
+        L, R, T, B = 46, 10, 20, 18
+        pw, ph = w - L - R, h - T - B
+        pygame.draw.rect(s, (10, 12, 17), (L, T, pw, ph))
+        hist = self.ep_hist[-60:]
+        if not hist:
+            self.text(s, 'no finished episode yet', (L + 8, T + 8), DIM, self.small)
+            return '0 ep'
+        ticks = nice_ticks(min(0, min(hist)), max(0, max(hist)))
+        y0, y1 = ticks[0], ticks[-1]
+        ypx = lambda v: T + ph * (1 - (v - y0) / (y1 - y0))
+        for v in ticks:
+            pygame.draw.line(s, GRID, (L, ypx(v)), (L + pw, ypx(v)))
+            self.text(s, f'{v:g}', (L - 5, ypx(v) - 6), DIM, self.small, right=True)
+        bw = pw / 60
+        for k, r in enumerate(hist):
+            x = L + k * bw
+            pygame.draw.rect(s, GREEN if r >= 0 else RED, (x + 1, min(ypx(0), ypx(r)), max(bw - 2, 1), abs(ypx(r) - ypx(0)) + 1))
+        avg = [np.mean(hist[max(0, k - 9):k + 1]) for k in range(len(hist))]
+        if len(avg) > 1:
+            pygame.draw.lines(s, CYAN, False, [(L + (k + .5) * bw, ypx(a)) for k, a in enumerate(avg)], 2)
+        pygame.draw.rect(s, EDGE, (L, T, pw, ph), 1)
+        self.text(s, f'■ return   — mean(10) {avg[-1]:+.1f}   last {hist[-1]:+.1f}', (L + 4, 3), CYAN, self.small)
+        return f'{len(self.ep_hist)} ep'
+
+    def p_chart(self, name):
+        specs = {'ch_speed': (['speed', 'target'], [CYAN, DIM], ['v', 'target'], ' km/h', 0, None),
+                 'ch_ctrl': (['steer', 'throttle', 'brake'], [ORANGE, GREEN, RED], ['steer', 'thr', 'brk'], '', -1, 1),
+                 'ch_reward': (['reward'], [GREEN], ['r'], '', None, None),
+                 'ch_safety': (['front', 'ttc'], [YELLOW, RED], ['gap', 'ttc'], '', 0, COOP_CORRIDOR),
+                 'ch_v2x': (['msg', 'lat', 'loss'], [CYAN, MAG, ORANGE], ['msg/s', 'ms', 'loss%'], '', 0, None),
+                 'ch_value': (['value', 'pi_pedal', 'pi_steer'], [CYAN, GREEN, ORANGE], ['V', 'π_ped', 'π_str'], '', None, None),
+                 'ch_perf': (['step_ms', 'vae_ms', 'pi_ms', 'draw_ms'], [CYAN, MAG, GREEN, ORANGE], ['sim', 'vae', 'π', 'draw'], '', 0, None)}
+        keys, colors, names, unit, lo, hi = specs[name]
+
+        def draw(s, env, o):
+            self.chart(s, keys, colors, names, unit, lo, hi)
+            return '30 s window'
+        return draw
+
+    def p_terminal(self, s, env, o):
+        w, h = s.get_size()
+        pygame.draw.rect(s, (6, 8, 11), (0, 0, w, h))
+        rows = self.term_rows()
+        for k, (stamp, simt, level, msg) in enumerate(self.term.view(rows)):
+            y = 4 + k * 15
+            self.text(s, stamp, (6, y), DIM, self.small)
+            self.text(s, f'{level:4}', (92, y), LEVEL_COLOR[level], self.small)
+            self.text(s, ('$ ' + msg) if level == 'CMD' else msg, (130, y - 1), LEVEL_COLOR[level] if level != 'INFO' else FG, self.mono)
+        y = h - 20
+        pygame.draw.line(s, EDGE, (0, y - 4), (w, y - 4))
+        pw = self.text(s, f'coop@carla:{self.config.split()[0]}$ ', (6, y), GREEN, self.mono)
+        cur = '█' if time.time() % 1 < .5 else ' '
+        self.text(s, self.line + cur, (6 + pw, y), FG, self.mono)
+        if self.term.scroll:
+            self.text(s, f'↑ {self.term.scroll} lines · PgDn', (w - 8, y), ORANGE, self.small, right=True)
+        return f'● REC {os.path.basename(self.term.path)}'
+
+    def term_rows(self):
+        return (BOTTOM - 20 - 30) // 15
+
+    def p_system(self, s, env, o):
+        sim_ok = self.ms['step'] < 200
+        cams_ok = all(c.frame is not None for c in self.cams.values())
+        lid = sum(l.latest is not None for l in env.lidar_objs)
+        denm = env.infra.warning_now() if env.infra else None
+        v2x = env.infra.channel.summary(env.infra.t) if env.infra else None
+        ctrl = env.vehicle.get_control()
+        rows = [('SIM', GREEN if sim_ok else ORANGE, f'sync 20 Hz · step {self.ms["step"]:5.1f} ms', f'RTF {0.05 / max(1e-3, self.loop_s):.2f}×'),
+                ('SENSORS', GREEN if cams_ok and lid == len(env.lidar_objs) else ORANGE, f'{len(self.cams) + bool(self.rsu_cam)} cam · {lid}/{len(env.lidar_objs)} lidar',
+                 f'{len(env.infra.rsus) if env.infra else 0} RSU'),
+                ('PERCEPT', GREEN, f'VAE z{LATENT_DIM} · {self.ms["vae"]:4.1f} ms', 'semseg→z'),
+                ('FUSION', GREEN if lid else RED, f'{COOP_SECTORS} sect · obs {100 + COOP_OBS}', f'gap {min(env.front_obstacle, 99):.0f} m'),
+                ('V2X', (GREEN if env.infra.enabled else RED) if env.infra else (50, 60, 70),
+                 f"{v2x['msg_per_s']:.0f} msg/s · {v2x['latency_ms']:.0f} ms" if v2x else 'disabled', f"loss {100 * v2x['loss']:.0f}%" if v2x else ''),
+                ('EDGE', RED if denm is not None else GREEN if env.infra else (50, 60, 70),
+                 f"DENM {env.infra.warning['kind']} {denm:.1f} s" if denm is not None else 'conflict monitor idle' if env.infra else 'disabled', ''),
+                ('POLICY', GREEN if self.policy_ok else ORANGE, f'{self.driver} · {self.ms["policy"]:4.2f} ms', f'V {self.value:+.2f}'),
+                ('CONTROL', RED if ctrl.brake > 0 else GREEN, f'str {ctrl.steer:+.2f} thr {ctrl.throttle:.2f} brk {ctrl.brake:.2f}', ''),
+                ('RENDER', GREEN if self.fps > 10 else ORANGE, f'page {self.page} · {self.ms["draw"]:4.1f} ms', f'{self.fps:4.1f} fps'),
+                ('LOGGER', GREEN, f'{len(self.term.lines)} lines', 'REC')]
+        for k, (name, col, a, b) in enumerate(rows):
+            y = 6 + k * 20
+            self.led(s, (12, y + 7), col)
+            self.text(s, name, (24, y), FG, self.bold)
+            self.text(s, a, (104, y + 1), FG, self.small)
+            self.text(s, b, (s.get_width() - 8, y + 1), DIM, self.small, right=True)
+        return 'nominal' if sim_ok and cams_ok else 'degraded'
+
+    def panel_fn(self, name):
+        if name in CAMS or name == 'rsu':
+            return self.p_camera(name)
+        if name.startswith('ch_'):
+            return self.p_episodes if name == 'ch_episodes' else self.p_chart(name)
+        return getattr(self, 'p_' + name)
+
+    # ------------------------------------------------------------------ frame
+    def draw(self, env, o):
+        t0 = time.time()
+        self.loop_s, self.last_frame = t0 - self.last_frame, t0
+        self.fps = 0.9 * self.fps + 0.1 / max(1e-3, self.loop_s)
+        self.sim_now = env.world.get_snapshot().timestamp.elapsed_seconds
         if env.timesteps % 5 == 0:  # keep the CARLA server window on the ego
             t = env.vehicle.get_transform()
             f = t.get_forward_vector()
@@ -411,241 +1073,76 @@ class Dashboard:
                 t.location + carla.Location(x=-12 * f.x, y=-12 * f.y, z=8), carla.Rotation(pitch=-25, yaw=t.rotation.yaw)))
         s = self.screen
         s.fill(BG)
-        chaos = 'off' if not env.traffic else ('off' if not env.traffic.chaos else f'{env.traffic.chaos:.0f}s')
-        self.text(f'COOP-DRIVE   {env.town}   driver {self.driver}   ep {self.episode}   step {env.timesteps}   '
-                  f'R {self.ep_reward:.0f}   chaos {chaos}' + ('   PAUSED' if self.paused else ''), (10, 6), FG)
-
-        # 1 camera
-        self.panel((0, HEAD, *BIG), '')
-        if self.chase and self.chase.frame is not None:
-            s.blit(pygame.surfarray.make_surface(self.chase.frame), (0, HEAD))
-        self.text(' Camera ', (8, HEAD + 4), CYAN, self.big, BG)
-
-        # 2 cooperative LiDAR (CODD-style)
-        scans = [l.latest for l in env.lidar_objs if l.latest is not None]
-        n_cars = len(scans)
-        if env.infra:
-            scans += [r['lidar'].latest for r in env.infra.rsus if r['lidar'].latest is not None]
-        img, marks = lidar_render([sc[0] for sc in scans], [sc[1] for sc in scans], env.lidar_objs[0].latest[1], BIG)
-        s.blit(pygame.surfarray.make_surface(img), (BIG[0], HEAD))
-        for u, v, i in marks:
-            if i >= n_cars:
-                pygame.draw.rect(s, YELLOW, (BIG[0] + u - 5, HEAD + v - 5, 10, 10), 2)
-            else:
-                pygame.draw.circle(s, (255, 255, 255) if i == 0 else CYAN, (BIG[0] + u, HEAD + v), 6 if i == 0 else 4, 2)
-        rsu = f' + {len(scans) - n_cars} RSU' if env.infra else ''
-        self.text(f' Coop LiDAR · {n_cars} cars{rsu} ', (BIG[0] + 8, HEAD + 4), CYAN, self.big, BG)
-
-        row = HEAD + BIG[1] + 2
-        sectors = obs[100:100 + COOP_SECTORS].cpu().numpy()
-        # 3 sensors
-        x, y = self.panel((0, row, *CELL), 'Sensors')
-        sem = env.image_obs.reshape(80, 160, 3)[:, :, ::-1]  # buffer order is H x W, BGR
-        s.blit(pygame.transform.scale(pygame.surfarray.make_surface(sem.swapaxes(0, 1).copy()), (300, 150)), (x, y))
-        cx, cy, r = x + 150, y + 236, 70
-        n = len(sectors)
-        for k in range(n):
-            a0, a1 = -math.pi + k * 2 * math.pi / n, -math.pi + (k + 1) * 2 * math.pi / n
-            rr = 12 + (r - 12) * sectors[k]
-            col = RED if sectors[k] < .15 else ORANGE if sectors[k] < .4 else GREEN
-            pygame.draw.polygon(s, col, [(cx, cy)] + [(cx + rr * math.sin(a), cy - rr * math.cos(a)) for a in np.linspace(a0, a1, 4)])
-        pygame.draw.circle(s, DIM, (cx, cy), r, 1)
-        pygame.draw.polygon(s, FG, [(cx, cy - 9), (cx - 5, cy + 6), (cx + 5, cy + 6)])
-        # outer ring: how much each direction drives the pedal right now (now + motion features of that sector)
-        steer_s, pedal_s = input_sensitivity(self.agent.old_policy.actor, obs)
-        c0 = LATENT_DIM + 5
-        sect = pedal_s[c0:c0 + n] + pedal_s[c0 + n + 1:c0 + 2 * n + 1]
-        top = sect.max() or 1.0
-        for k in range(n):
-            a0, a1 = -math.pi + k * 2 * math.pi / n, -math.pi + (k + 1) * 2 * math.pi / n
-            w = sect[k] / top
-            if w > 0.5:  # only the directions that clearly dominate the decision
-                pts = [(cx + (r + 6) * math.sin(a), cy - (r + 6) * math.cos(a)) for a in np.linspace(a0, a1, 5)]
-                pygame.draw.lines(s, (int(70 + 185 * w), int(200 * w), 255), False, pts, int(2 + 6 * w))
-
-        # 4 perception + policy
-        x, y = self.panel((CELL[0], row, *CELL), 'VAE · PPO')
-        with torch.no_grad():
-            rec = self.decoder(obs[:LATENT_DIM].unsqueeze(0).to(next(self.decoder.parameters()).device))[0]
-            o = obs.cpu().unsqueeze(0)
-            mean = self.agent.old_policy.actor(o)[0].numpy()
-            value = float(self.agent.old_policy.critic(o)[0])
-        recimg = (rec.permute(2, 1, 0).cpu().numpy() * 255).astype(np.uint8)
-        s.blit(pygame.transform.scale(pygame.surfarray.make_surface(recimg), (300, 150)), (x, y))
-        for k, val in enumerate(obs[:LATENT_DIM].cpu().numpy()):
-            c = int(np.clip(128 + 40 * val, 0, 255))
-            pygame.draw.rect(s, (c, 60, 255 - c), (x + k * 3, y + 160, 3, 16))
-        self.bar(x, y + 196, 150, mean[0], 'π steer', ORANGE)
-        self.bar(x, y + 216, 150, mean[1], 'π pedal', GREEN)
-        groups = group_sensitivity(pedal_s, LATENT_DIM, COOP_SECTORS)
-        total = sum(groups.values()) or 1.0
-        why = sorted(groups.items(), key=lambda kv: -kv[1])[:3]
-        verb = 'brakes' if mean[1] < -0.05 else 'accelerates' if mean[1] > 0.05 else 'holds'
-        self.text(f'policy {verb} because of:' if self.policy_ok else 'no policy loaded (expert drives)', (x, y + 236), CYAN, self.small)
-        for k, (name, val) in enumerate(why):
-            pygame.draw.rect(s, (50, 50, 60), (x, y + 256 + k * 17, 120, 10))
-            pygame.draw.rect(s, GREEN, (x, y + 256 + k * 17, int(120 * val / total), 10))
-            self.text(f'{name} {100 * val / total:.0f}%', (x + 128, y + 253 + k * 17), FG, self.small)
-        self.text(f'V(s) {value:+.2f}', (x, y + 310), FG, self.small)
-
-        # 5 reward logic
-        x, y = self.panel((2 * CELL[0], row, *CELL), 'Reward')
-        centering = max(1 - env.distance_from_center / env.max_distance_from_center, 0)
-        angle_f = max(1 - abs(env.angle / np.deg2rad(20)), 0)
-        ctrl = env.vehicle.get_control()
-        flags = [('collision', bool(env.collision_history)), (f'off-lane >{env.max_distance_from_center:.0f} m', env.distance_from_center > env.max_distance_from_center),
-                 (f'>{env.max_speed:.0f} km/h', env.velocity > env.max_speed), ('stuck 10 s', False)]
-        lines = [
-            (f'speed {env.velocity:5.1f} km/h   [{env.min_speed:.0f}–{env.target_speed:.0f}]', FG),
-            (f'center {env.distance_from_center:4.2f} m   ×{centering:.2f}', FG),
-            (f'heading {math.degrees(env.angle):+5.1f}°   ×{angle_f:.2f}', FG),
-            (f'reward {reward:+.2f}', GREEN if reward > 0 else RED),
-            (f'steer {ctrl.steer:+.2f}  thr {ctrl.throttle:.2f}  brk {ctrl.brake:.2f}', RED if ctrl.brake > 0 else FG),
-            (f'wp {env.current_waypoint_index}/{len(env.route_waypoints)}', FG),
-        ]
-        for k, (line, col) in enumerate(lines):
-            self.text(line, (x, y + k * 20), col, self.small)
-        for k, (name, on) in enumerate(flags):
-            self.text(('● ' if on else '○ ') + name, (x + (k % 2) * 150, y + 128 + (k // 2) * 18), RED if on else DIM, self.small)
-        if env.infra:
-            v2x = env.infra.channel.summary(env.infra.t)
-            ego_l = env.vehicle.get_location()
-            near = sum(math.hypot(r['xy'][0] - ego_l.x, r['xy'][1] - ego_l.y) < 50 for r in env.infra.rsus)
-            la = env.infra.light_ahead
-            infra_lines = [(f"V2X {'on' if env.infra.enabled else 'OFF'}  {v2x['msg_per_s']:.0f} msg/s  {v2x['latency_ms']:.0f} ms  "
-                            f"lost {100 * v2x['loss']:.0f}%", CYAN),
-                           (f'RSU near {near}/{len(env.infra.rsus)}   objects known {len(env.infra.known)}', CYAN),
-                           (f'light ahead {la[1].upper()} {la[2]:.0f} s · {la[0]:.0f} m' if la else 'light ahead: none', RED if la and la[1] == 'Red' else YELLOW if la else DIM)]
-            for k, (line, col) in enumerate(infra_lines):
-                self.text(line, (x, y + 172 + k * 18), col, self.small)
-        self.reward_hist = (self.reward_hist + [reward])[-150:]
-        pts = [(x + k * 2, y + 290 - 40 * max(rw, -1)) for k, rw in enumerate(self.reward_hist)]
-        if len(pts) > 1:
-            pygame.draw.lines(s, GREEN, False, pts, 1)
-
-        # 6 traffic
-        x, y = self.panel((3 * CELL[0], row, *CELL), 'Traffic')
-        t = env.vehicle.get_transform()
-        yaw = math.radians(t.rotation.yaw)
-        mx, my, scale = x + BEV[0] // 2, y + BEV[1] // 2, BEV_PX_PER_M
-        if self.bev and self.bev.frame is not None:
-            s.blit(pygame.surfarray.make_surface(self.bev.frame), (x, y))
-
-        def to_map(l):
-            dx, dy = l.x - t.location.x, l.y - t.location.y
-            f, rgt = dx * math.cos(yaw) + dy * math.sin(yaw), -dx * math.sin(yaw) + dy * math.cos(yaw)
-            return mx + rgt * scale, my - f * scale
-
-        s.set_clip(pygame.Rect(x, y, *BEV))
-        route = [to_map(w.transform.location) for w in env.route_waypoints[env.current_waypoint_index::2][:40]]
-        if len(route) > 1:
-            pygame.draw.lines(s, (90, 90, 120), False, route, 2)
-        # every road user within 30 m: where it will be in 2 s (arrow) and whether it meets the ego within 3 s
-        ev = env.vehicle.get_velocity()
-        c, sn = math.cos(yaw), math.sin(yaw)
-        to_ego = lambda dx, dy: (dx * c + dy * sn, -dx * sn + dy * c)  # world xy -> (forward, right)
-        worst = None
-        for a in list(env.world.get_actors().filter('vehicle.*')) + list(env.world.get_actors().filter('walker.pedestrian.*')):
-            if a.id == env.vehicle.id:
-                continue
-            l, v = a.get_location(), a.get_velocity()
-            p = to_ego(l.x - t.location.x, l.y - t.location.y)
-            if math.hypot(*p) > 30:
-                continue
-            va, vr = to_ego(v.x, v.y), to_ego(v.x - ev.x, v.y - ev.y)
-            ttc, dist = closest_approach([p], [vr])
-            danger = dist[0] < 2.5 and 0 < ttc[0] < 3
-            u = (mx + p[1] * scale, my - p[0] * scale)
-            tip = (mx + (p[1] + 2 * va[1]) * scale, my - (p[0] + 2 * va[0]) * scale)
-            col = RED if danger else YELLOW if a.type_id.startswith('walker') else ORANGE if a.type_id in MOTORBIKES + BICYCLES else CYAN
-            if math.hypot(va[0], va[1]) > 0.5:
-                pygame.draw.line(s, col, u, tip, 2)
-            pygame.draw.circle(s, col, (int(u[0]), int(u[1])), 6 if danger else 3, 2 if danger else 0)
-            if danger:
-                meet = (mx + (p[1] + vr[1] * ttc[0]) * scale, my - (p[0] + vr[0] * ttc[0]) * scale)
-                pygame.draw.circle(s, RED, (int(meet[0]), int(meet[1])), 4)
-                if worst is None or ttc[0] < worst[0]:
-                    worst = (ttc[0], a.type_id.split('.')[-1])
-        if env.infra:
-            for r in env.infra.rsus:
-                p = to_ego(r['xy'][0] - t.location.x, r['xy'][1] - t.location.y)
-                pygame.draw.rect(s, YELLOW, (mx + p[1] * scale - 5, my - p[0] * scale - 5, 10, 10), 2)
-            if env.infra.warning_now() is not None:
-                w = env.infra.warning
-                p = to_ego(w['x'] - t.location.x, w['y'] - t.location.y)
-                cx_, cy_ = mx + p[1] * scale, my - p[0] * scale
-                pygame.draw.line(s, RED, (cx_ - 7, cy_ - 7), (cx_ + 7, cy_ + 7), 3)
-                pygame.draw.line(s, RED, (cx_ - 7, cy_ + 7), (cx_ + 7, cy_ - 7), 3)
-            for o in env.infra.known.values():
-                age = env.infra.t - o['t']
-                p = to_ego(o['x'] + o['vx'] * age - t.location.x, o['y'] + o['vy'] * age - t.location.y)
-                pygame.draw.rect(s, (120, 255, 255), (mx + p[1] * scale - 4, my - p[0] * scale - 4, 8, 8), 1)
-        pygame.draw.polygon(s, FG, [(mx, my - 8), (mx - 5, my + 6), (mx + 5, my + 6)])
-        s.set_clip(None)
-        denm = env.infra.warning_now() if env.infra else None
-        labels = ([(f"DENM: {env.infra.warning['kind']} cuts in {denm:.1f} s ({env.infra.warning['from']})", RED)] if denm is not None else [])             + ([(f'Conflict in {worst[0]:.1f} s: {worst[1]}', RED)] if worst else []) + detect_situations(env)
-        for k, (label, col) in enumerate(labels[:5]):
-            self.text('● ' + label, (x, y + 186 + k * 17), col, self.small)
-
-        # console: log + command line, help overlay
-        cy0 = H - CONSOLE
-        pygame.draw.rect(s, PANEL, (0, cy0, W, CONSOLE), border_radius=6)
-        self.text('Console', (8, cy0 + 4), CYAN, self.big)
-        for k, e in enumerate(reversed(self.events[:5])):
-            self.text(e[:58], (100, cy0 + 6 + k * 16), FG if k == min(4, len(self.events) - 1) else DIM, self.mono)
-        m = self.metrics.summary()
-        self.text(f"session {m['km'] * 1000:.0f} m   collisions/km {m['collisions_per_km']:.1f}   near-miss s/km "
-                  f"{m['near_miss_s_per_km']:.1f}   red/km {m['red_runs_per_km']:.1f}   v {m['mean_speed']:.1f} km/h",
-                  (650, cy0 + 4), FG, self.small)
-        tx0, tx1, ty = 650, W - 16, cy0 + 52  # last 60 s, now on the right
-        pygame.draw.line(s, DIM, (tx0, ty), (tx1, ty), 1)
-        for sec in range(0, 61, 10):
-            px = tx1 - (tx1 - tx0) * sec / 60
-            pygame.draw.line(s, DIM, (px, ty - 3), (px, ty + 3), 1)
-            self.text(f'-{sec}s' if sec else 'now', (px - 10, ty + 6), DIM, self.small)
-        styles = {'denm': (RED, 10), 'chaos': (CYAN, 9), 'near_miss': (ORANGE, 5), 'red_light': (YELLOW, 7), 'collision': (RED, 12), 'episode': (FG, 14)}
-        for k, (ts, kind, label) in enumerate(self.timeline):
-            px = tx1 - (tx1 - tx0) * (self.sim_t - ts) / 60
-            col, hgt = styles.get(kind, (DIM, 5))
-            pygame.draw.line(s, col, (px, ty - hgt), (px, ty), 3 if kind == 'collision' else 1)
-            if label and kind != 'near_miss':
-                self.text(label, (px - 4, ty - hgt - 14 - 12 * (k % 2)), col, self.small)
-        pygame.draw.rect(s, (8, 8, 12), (8, H - 28, W - 16, 22), border_radius=4)
-        prompt = '> ' + self.line + ('_' if time.time() % 1 < .5 else '') if self.typing else '> press / or Enter · /help'
-        self.text(prompt, (14, H - 26), FG if self.typing else DIM, self.mono)
-        if self.focus:  # enlarge one panel over the dashboard, aspect kept
-            rx, ry, rw, rh = PANELS[self.focus]
-            area = (W, H - CONSOLE - HEAD - 4)
-            k = min(area[0] / rw, area[1] / rh)
-            big = pygame.transform.smoothscale(s.subsurface((rx, ry, rw, rh)).copy(), (int(rw * k), int(rh * k)))
-            pygame.draw.rect(s, BG, (0, HEAD, W, area[1] + 2))
-            s.blit(big, ((W - big.get_width()) // 2, HEAD))
-            self.text(f' {self.focus} · /focus off ', (12, HEAD + 4), CYAN, self.big, BG)
-        if self.show_help:
-            bw, bh = 960, 28 + 22 * len(HELP)
-            bx, by = (W - bw) // 2, (H - bh) // 2
-            pygame.draw.rect(s, (8, 8, 12), (bx, by, bw, bh), border_radius=8)
-            pygame.draw.rect(s, CYAN, (bx, by, bw, bh), 1, border_radius=8)
-            for k, (c, d) in enumerate(HELP):
-                self.text(c, (bx + 16, by + 14 + 22 * k), CYAN, self.mono)
-                self.text(d, (bx + 240, by + 14 + 22 * k), FG, self.mono)
+        # header: identity, run id, configuration, clocks
+        pygame.draw.rect(s, HEADC, (0, 0, W, HEAD))
+        pygame.draw.line(s, CYAN, (0, HEAD - 1), (W, HEAD - 1))
+        x = 10 + self.text(s, 'COOP-DRIVE', (10, 6), CYAN, self.large)
+        x += 12 + self.text(s, 'research console', (x + 10, 11), DIM, self.small)
+        self.text(s, f'RUN {self.run_id}  ·  {self.config}  ·  ep {self.episode}  step {env.timesteps}  ·  R {self.ep_reward:+.1f}',
+                  (x + 16, 8), FG, self.mono)
+        right = f"sim {self.sim_t:8.2f} s   {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        self.text(s, right, (W - 10, 8), FG, self.mono, right=True)
+        state, scol = ('PAUSED', ORANGE) if self.paused else (self.mode.upper(), GREEN if self.mode == 'drive' else MAG)
+        sw = self.text(s, state, (W - 330, 7), scol, self.bold, right=True)
+        self.led(s, (W - 342 - sw, 15), scol)
+        # page tabs
+        for k, name in enumerate(PAGES):
+            rx = 6 + k * 150
+            on = name == self.page and not self.focus
+            pygame.draw.rect(s, (28, 40, 56) if on else PANEL, (rx, HEAD + 3, 146, TABS - 5))
+            pygame.draw.rect(s, CYAN if on else EDGE, (rx, HEAD + 3, 146, TABS - 5), 1)
+            self.text(s, f'F{k + 1}  {name.upper()}', (rx + 10, HEAD + 6), CYAN if on else DIM, self.small)
+        if self.focus:
+            self.text(s, f'FOCUS {self.focus} · focus off', (6 + len(PAGES) * 150 + 10, HEAD + 6), ORANGE, self.small)
+        self.text(s, f'obs {100 + COOP_OBS} · sectors {COOP_SECTORS} · coop {COOP_VEHICLES} · torch {torch.__version__.split("+")[0]} · '
+                     f'{"cuda" if torch.cuda.is_available() else "cpu"}', (W - 10, HEAD + 6), DIM, self.small, right=True)
+        layout = [(self.focus, PAGE_AREA)] if self.focus else PAGES[self.page]
+        for name, rect in layout + STRIP:
+            content = self.frame(name, rect)
+            try:
+                status = self.panel_fn(name)(content, env, o)
+            except Exception as e:  # one broken panel must not take the console down
+                status = 'error'
+                self.text(content, f'{type(e).__name__}: {e}'[:90], (8, 8), RED, self.small)
+            if status:
+                self.text(s, status, (rect[0] + rect[2] - 6, rect[1] + 3), GREEN if status in ('live', 'nominal') else DIM, self.small, right=True)
         self.frames.append(pygame.transform.smoothscale(s, (W // 2, H // 2)))
-        pygame.transform.smoothscale(s, self.window.get_size(), self.window)
+        if self.window.get_size() == (W, H):
+            self.window.blit(s, (0, 0))
+        else:
+            pygame.transform.smoothscale(s, self.window.get_size(), self.window)
         pygame.display.flip()
+        self.ms['draw'] = (time.time() - t0) * 1000
 
     def draw_replay(self):
         '''Half speed playback of the stored frames; returns False when it is over.'''
         f = self.replay[min(self.replay_i // 2, len(self.replay) - 1)]
         frame = pygame.transform.smoothscale(f, (W, H))
-        pygame.draw.rect(frame, RED, (0, 0, W, 30))
-        frame.blit(self.big.render(f'  REPLAY {self.replay_i // 2 + 1}/{len(self.replay)}  ·  half speed  ·  Esc to stop  ·  /gif to save',
-                                   True, FG), (10, 6))
+        pygame.draw.rect(frame, RED, (0, 0, W, HEAD))
+        frame.blit(self.bold.render(f'  REPLAY {self.replay_i // 2 + 1}/{len(self.replay)}  ·  half speed  ·  Esc to stop  ·  gif to save',
+                                    True, FG), (10, 8))
         pygame.transform.smoothscale(frame, self.window.get_size(), self.window)
         pygame.display.flip()
         self.replay_i += 1
         if self.replay_i // 2 >= len(self.replay):
             self.replay = None
         return self.replay is not None
+
+
+def latest_meta(chkpt_dir):
+    '''Training counters of the newest checkpoint_ppo_<n>.pickle (same numbering as continuous_driver.py).'''
+    n = len(next(os.walk(chkpt_dir))[2]) - 1 if os.path.isdir(chkpt_dir) else -1
+    path = f'{chkpt_dir}/checkpoint_ppo_{n}.pickle'
+    if n < 0 or not os.path.exists(path):
+        return None
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
+def save_meta(chkpt_dir, data, new_file):
+    n = len(next(os.walk(chkpt_dir))[2])
+    with open(f'{chkpt_dir}/checkpoint_ppo_{n if new_file else max(n - 1, 0)}.pickle', 'wb') as f:
+        pickle.dump(data, f)
 
 
 def main():
@@ -655,33 +1152,67 @@ def main():
     p.add_argument('--snapshot', default=None, help='save a PNG of the window every 200 steps')
     p.add_argument('--expert', action='store_true', help='drive with the waypoint expert from bc.py')
     p.add_argument('--vn', action='store_true', help='chaotic Vietnamese-style urban traffic (use with --town Town02)')
-    p.add_argument('--infra', action='store_true', help='roadside units + V2X (CAM / CPM / SPaT) feeding the ego')
+    p.add_argument('--infra', action='store_true', help='roadside units + V2X (CAM / CPM / SPaT / DENM) feeding the ego')
+    p.add_argument('--collect', type=int, default=0, help='record N expert steps for bc.py train, then exit')
+    p.add_argument('--noise', type=float, default=0.2, help='collect: steer noise std (executed, not labelled)')
+    p.add_argument('--no-scenarios', dest='scenarios', action='store_false', help='collect: no pedestrians / slow cars')
+    p.add_argument('--train', action='store_true', help='fine-tune PPO from the latest checkpoint, then exit')
+    p.add_argument('--total-timesteps', type=int, default=100000)
+    p.add_argument('--episode-length', type=int, default=3000)
     args = p.parse_args()
     assert COOP_SECTORS, 'dashboard needs COOP_SECTORS > 0 (simulation/settings.py)'
+    assert not (args.collect and args.train), 'pick one of --collect / --train'
+    mode = 'collect' if args.collect else 'train' if args.train else 'drive'
 
     client, world = ClientConnection(args.town).setup()
     env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, infra=args.infra)
     env.display_on = False  # the dashboard owns the pygame window
     encode = EncodeState(LATENT_DIM)
-    agent = PPOAgent(args.town, 0.05)
+    chkpt_dir = f'checkpoints/PPO_coop/{args.town}'
+    meta = latest_meta(chkpt_dir) if mode == 'train' else None
+    agent = PPOAgent(args.town, meta['action_std_init'] if meta else 0.05)
     policy_ok = False
     try:
-        agent.old_policy.load_state_dict(torch.load(args.model)) if args.model else agent.load()
+        if args.model:
+            agent.old_policy.load_state_dict(torch.load(args.model))
+            agent.policy.load_state_dict(torch.load(args.model))
+        else:
+            agent.load()
         policy_ok = True
     except Exception as e:  # no model yet, or trained with another observation size
         print('No matching policy, the expert drives:', e)
-    dash = Dashboard(agent, policy_ok)
-    if args.expert:
+    assert policy_ok or mode != 'train', 'training needs a policy to start from (run bc.py train first)'
+    config = f"{args.town} {'VN' if args.vn else 'TM'}{' +INFRA' if args.infra else ''} obs {100 + COOP_OBS}"
+    dash = Dashboard(agent, policy_ok, mode, config)
+    sys.stdout = Tee(sys.stdout, dash.log)
+    if args.expert and mode == 'drive':
         dash.driver = 'expert'
+    tr = dash.train
+    if mode == 'train':
+        os.makedirs(chkpt_dir, exist_ok=True)
+        meta = meta or {'cumulative_score': 0, 'episode': 0, 'timestep': 0, 'action_std_init': agent.action_std}
+        tr.update(timestep=meta['timestep'], steps0=meta['timestep'], episode=meta['episode'], avg=meta['cumulative_score'],
+                  target=meta['timestep'] + args.total_timesteps, std=agent.action_std)
+        dash.log(f"PPO fine-tune from timestep {meta['timestep']} · episode {meta['episode']} · σ {agent.action_std} · "
+                 f"+{args.total_timesteps:,} steps · checkpoints {chkpt_dir}", 'INFO')
+    data = None
+    if mode == 'collect':
+        import bc
+        data = ([], [], [], [], [])  # obs, obs_alt, act, rew, done
+        tr.update(target=args.collect)
+        dash.log(f'expert data collection · {args.collect:,} steps → {bc.DATA.format(args.town)}', 'INFO')
     clock = pygame.time.Clock()
     try:
         while not dash.quit:
             observation = env.reset()
             if observation is None:
+                dash.log('reset failed (no free spawn point?), retrying', 'WARN')
                 continue
             dash.new_episode(env)
-            action, reward = np.zeros(2), 0.0
             o = encode.process(observation)
+            alt = env.coop_obs_other() if data else None
+            steps = stuck = 0
+            done = False
             while not dash.quit:
                 dash.handle_events(env)
                 if dash.replay:
@@ -690,32 +1221,117 @@ def main():
                     continue
                 if dash.want_reset:
                     dash.want_reset = False
+                    if mode == 'train' and agent.memory.dones:
+                        agent.memory.dones[-1] = True
+                    if data and data[-1]:
+                        data[-1][-1] = True
                     client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list], True)
                     env.sensor_list.clear(); env.actor_list.clear(); env.riders.clear(); env.remove_sensors()
                     break
                 if dash.paused:
-                    dash.draw(env, o, action, 0.0)
+                    dash.draw(env, o)
                     clock.tick(20)
                     continue
-                action = expert_action(env) if dash.driver == 'expert' else agent.get_action(o, train=False)
-                result = env.step(action)
+                t0 = time.time()
+                if dash.driver == 'expert':
+                    action = expert_action(env)
+                    executed = action + np.array([np.random.normal(0, args.noise), 0.0]) if mode == 'collect' else action
+                else:
+                    action = executed = agent.get_action(o, train=mode == 'train')
+                dash.ms['policy'] = (time.time() - t0) * 1000
+                t0 = time.time()
+                result = env.step(executed)
+                dash.ms['step'] = (time.time() - t0) * 1000
                 if result is None:
+                    if mode == 'train':  # keep the rollout aligned: drop the action that got no reward
+                        for buf in (agent.memory.observation, agent.memory.actions, agent.memory.log_probs):
+                            buf.pop()
+                        if agent.memory.dones:
+                            agent.memory.dones[-1] = True
+                    dash.log('environment step failed, new episode', 'WARN')
                     break
                 observation, reward, done, info = result
+                steps += 1
+                stuck = stuck + 1 if env.velocity < 1 else 0
+                if mode == 'collect':
+                    if args.scenarios and env.timesteps % 250 == 0 and env.front_obstacle == np.inf and env.velocity > 10:
+                        spawn_scenario(env, random.choice([1, 2]))
+                    done = done or stuck > 400  # 20 s still (e.g. stuck traffic): give up this episode
+                    o_np = o.cpu().numpy()
+                    for buf, v in zip(data, (o_np, np.concatenate([o_np[:100], alt]), action, reward, done)):
+                        buf.append(v)
+                    tr['timestep'] = len(data[0])
+                    if not done:
+                        alt = env.coop_obs_other()
+                    if len(data[0]) >= args.collect:
+                        done = True
+                elif mode == 'train':
+                    done = done or steps >= args.episode_length
+                    agent.memory.rewards.append(reward)
+                    agent.memory.dones.append(done)
+                    tr['timestep'] += 1
+                    if tr['timestep'] == tr['target'] - 1:
+                        agent.chkpt_save()
                 dash.ep_reward += reward
-                crashed = dash.after_step(env)
+                crashed = dash.after_step(env, o, reward)
                 if done:
-                    dash.log(f'episode {dash.episode} end · R {dash.ep_reward:.0f} · ' + ('route done' if reward > -10 else 'penalty −10'))
-                    dash.mark('episode', 'end')
-                    env.riders.clear()
-                    if crashed or reward <= -10:
-                        dash.start_replay()  # instant replay of the last seconds before the episode ended
                     break
+                t0 = time.time()
                 o = encode.process(observation)
-                dash.draw(env, o, action, reward)
+                dash.ms['vae'] = (time.time() - t0) * 1000
+                dash.draw(env, o)
                 if args.snapshot and env.timesteps % 200 == 0:
                     pygame.image.save(dash.screen, args.snapshot)
+            if not done:
+                continue
+            # ---- episode finished
+            dash.ep_hist.append(dash.ep_reward)
+            dash.log(f'episode {dash.episode} end · R {dash.ep_reward:+.1f} · {steps} steps · ' + ('route done' if reward > -10 else 'penalty −10'),
+                     'INFO' if reward > -10 else 'WARN')
+            dash.mark('episode', 'end')
+            env.riders.clear()
+            if mode == 'collect':
+                data[-1][-1] = True  # cut an unfinished episode for the return computation
+                bc.save(args.town, *data)
+                dash.log(f'collected {len(data[0]):,} / {args.collect:,} steps (saved)', 'INFO')
+                if len(data[0]) >= args.collect:
+                    dash.log('collection complete', 'INFO')
+                    dash.quit = True
+            elif mode == 'train':
+                tr['episode'] += 1
+                tr['avg'] = (tr['avg'] * (tr['episode'] - 1) + dash.ep_reward) / tr['episode']
+                state = {'cumulative_score': tr['avg'], 'episode': tr['episode'], 'timestep': tr['timestep'], 'action_std_init': agent.action_std}
+                if tr['episode'] % 10 == 0:
+                    dash.log(f"PPO update on {len(agent.memory.rewards):,} steps…", 'INFO')
+                    dash.draw(env, o)
+                    t0 = time.time()
+                    agent.learn()
+                    agent.chkpt_save()
+                    save_meta(chkpt_dir, state, new_file=False)
+                    tr['updates'] += 1
+                    tr['update_s'] = time.time() - t0
+                    tr['saves'] += 1
+                    dash.log(f"update {tr['updates']} done in {tr['update_s']:.1f} s · checkpoint saved · avg return {tr['avg']:+.2f}", 'INFO')
+                if tr['episode'] % 100 == 0:
+                    agent.save()
+                    save_meta(chkpt_dir, state, new_file=True)
+                    tr['saves'] += 1
+                    dash.log(f"new policy file at episode {tr['episode']}", 'INFO')
+                if tr['timestep'] >= tr['target']:
+                    agent.chkpt_save()
+                    save_meta(chkpt_dir, state, new_file=False)
+                    dash.log('fine-tune complete', 'INFO')
+                    dash.quit = True
+            if (crashed or reward <= -10) and mode == 'drive':
+                dash.start_replay()  # instant replay of the last seconds before the episode ended
+    except Exception:
+        import traceback
+        dash.log(traceback.format_exc(), 'ERR')
+        raise
     finally:
+        sys.stdout = sys.stdout.stream if isinstance(sys.stdout, Tee) else sys.stdout
+        dash.log('session closed', 'INFO')
+        dash.term.close()
         client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list + env.walker_list], True)
         if env.traffic:
             env.traffic.destroy()

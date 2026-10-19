@@ -31,11 +31,16 @@ thành `COOP_SECTORS` khoảng cách vật cản gần nhất theo từng góc, 
 
 ### Dashboard
 
-`Dashboard.bat` (shortcut "Coop-Drive Dashboard") hoặc `venv\Scripts\python dashboard.py [--town Town02 --vn] [--model x.pth] [--expert]`.
-6 ô: camera, LiDAR hợp tác kiểu CODD, cảm biến, VAE · PPO, reward, traffic (bản đồ + nhãn tình huống) và Console (log + lệnh).
-Bấm `/` hoặc Enter để gõ lệnh, `/help` để xem: `/spawn <event>`, `/chaos on|off|<s>`, `/density <n>`, `/driver expert|ppo`,
-`/weather clear|cloudy|rain|sunset`, `/pause`, `/reset`, `/snapshot`, `/clear`, `/quit`.
-Ô Traffic: camera nhìn từ trên xuống, mũi tên = vị trí sau 2 s, vòng đỏ = sắp gặp ego trong < 3 s (TTC). Vòng sáng quanh radar và dòng "policy brakes because of" = đầu vào chi phối quyết định ga/phanh (gradient của actor). Console: chỉ số cả phiên + dải 60 s sự kiện. Va chạm → tự phát lại ~10 s cuối; `/replay`, `/gif`, `/focus <ô>`, ↑/↓ lịch sử lệnh, Tab tự hoàn thành.
+`Dashboard.bat` (shortcut "Coop-Drive Dashboard") hoặc `venv\Scripts\python dashboard.py [--town Town02 --vn --infra] [--model x.pth] [--expert]`.
+Giao diện kiểu research console, 5 trang (F1–F5 hoặc `page <tên>`):
+- **overview**: camera chase, LiDAR hợp tác kiểu CODD, BEV + vùng nguy hiểm, telemetry, biểu đồ tốc độ, đánh giá tình huống.
+- **cameras**: chase, hood, gương trái/phải, camera lùi, BEV, camera trên cột RSU gần nhất.
+- **sensors**: ảnh semantic (đầu vào), VAE tái tạo + latent z, radar 16 sector + vùng chi phối pedal, V2X/RSU/SPaT/DENM, bảng mọi cảm biến (tần số, số điểm, tuổi frame), LiDAR hợp nhất.
+- **charts**: 8 biểu đồ 30 s: tốc độ, điều khiển, reward, khoảng trống/TTC, V2X, V(s)/π, return từng episode, thời gian vòng lặp.
+- **policy**: actor/critic + phân bổ nguyên nhân ga/phanh, các thành phần reward, run control (tiến độ train/collect, ETA), chỉ số phiên + dải sự kiện 60 s.
+Luôn hiện: **terminal** (gõ thẳng lệnh, `help`; log có mức INFO/WARN/ERR/CMD/OUT/EVT/SYS và giờ; ↑/↓ lịch sử, Tab, PgUp/PgDn hoặc lăn chuột để cuộn; mọi lệnh và log ghi vào `logs/session_<run>.log`) và **system status** (đèn trạng thái + độ trễ của SIM, SENSORS, PERCEPT, FUSION, V2X, EDGE, POLICY, CONTROL, RENDER, LOGGER).
+Lệnh: `spawn <event>`, `chaos on|off|<s>`, `density <n>`, `driver expert|ppo`, `weather …`, `v2x …`, `pause`, `reset`, `replay`, `gif`, `focus <ô>`, `snapshot`, `stats`, `history`, `log`, `cls`, `quit`.
+Train ngay trong dashboard: `--collect 40000` (tài xế mẫu thu dữ liệu cho `bc.py train`), `--train --total-timesteps 100000` (fine-tune PPO từ checkpoint mới nhất). `pipeline_dash.sh` chạy cả chuỗi collect → BC → đánh giá → fine-tune → đánh giá, hai bước có mô phỏng hiện trong dashboard.
 Action thứ hai: > 0 là ga, < 0 là phanh. Chưa có model khớp observation thì tài xế mẫu lái.
 
 ### Giao thông đô thị kiểu Việt Nam (`--vn`, nên dùng Town02)
