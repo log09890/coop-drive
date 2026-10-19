@@ -43,3 +43,17 @@ three = dict(half_width=1.3, z_min=0.3, z_max=1.5)
 assert corridor_distance([[[10, 0, -1.4, 1]]], [ego], straight, **three) == np.inf
 assert corridor_distance([[[10, 0, -1.4, 1], [10, 0.2, -1.6, 1], [10.5, 0, -1.8, 1]]], [ego], straight, **three) == 7
 print('corridor ok')
+
+from simulation.coop import safety_penalty
+assert safety_penalty(np.inf, 10, 20, False, 0, 0) == 0  # calm driving costs nothing
+assert np.isclose(safety_penalty(1.5, 10, 20, False, 0, 0), 0.25)  # near miss
+assert safety_penalty(1.5, 0.5, 3, False, 0, 0) == 0  # crawling in a swarm is fine
+assert np.isclose(safety_penalty(np.inf, 10, 20, True, 0, 0), 0.5)  # red light
+assert np.isclose(safety_penalty(np.inf, 10, 20, False, 2, 2), 0.2)  # jerk is capped
+print('safety ok')
+
+from evaluate import summarize
+s = summarize([dict(km=0.5, route_done=True, progress=1.0, collisions=1, near_miss_steps=20, red_runs=0, mean_speed=15, jerk=0.1, end='route_done'),
+               dict(km=0.5, route_done=False, progress=0.5, collisions=0, near_miss_steps=0, red_runs=2, mean_speed=5, jerk=0.3, end='stuck')])
+assert s['collisions_per_km'] == 1 and s['near_miss_s_per_km'] == 1.0 and s['red_light_runs_per_km'] == 2 and s['route_done_%'] == 50
+print('summary ok')

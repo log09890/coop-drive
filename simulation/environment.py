@@ -5,13 +5,15 @@ import numpy as np
 import pygame
 from simulation.connection import carla
 from simulation.sensors import CameraSensor, CameraSensorEnv, CollisionSensor, LidarSensor
-from simulation.coop import sector_distances, corridor_distance
+from simulation.coop import sector_distances, corridor_distance, safety_penalty
 from simulation.settings import *
 
 
 class CarlaEnvironment():
 
-    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True, traffic=False) -> None:
+    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True, traffic=False, share=True) -> None:
+        self.share = share  # False: the coop features use the ego LiDAR only (ablation)
+        self.prev_coop, self.last_sectors, self.prev_pedal = {}, np.ones(max(COOP_SECTORS, 1)), 0.0
 
 
         self.client = client
@@ -38,6 +40,8 @@ class CarlaEnvironment():
         self.lidar_objs = list()
         self.front_obstacle = np.inf
         self.last_blocked = 0.0
+        self.d_steer = self.d_pedal = 0.0
+        self.red_moving = False
 
         # Two very important lists for keeping track of our actors and their observations.
         self.sensor_list = list()
@@ -80,6 +84,8 @@ class CarlaEnvironment():
             elif self.town == "Town02":
                 transform = self.map.get_spawn_points()[1] #Town2 is 1
                 self.total_distance = 780
+                if self.traffic and self.fresh_start:  # VN mode: a new random route every time
+                    transform = random.choice(self.map.get_spawn_points())
             else:
                 transform = random.choice(self.map.get_spawn_points())
                 self.total_distance = 250
@@ -136,7 +142,12 @@ class CarlaEnvironment():
                 current_waypoint = self.waypoint
                 self.route_waypoints.append(current_waypoint)
                 for x in range(self.total_distance):
-                    if self.town == "Town07":
+                    if self.traffic:  # random turn at every junction (VN mode)
+                        options = current_waypoint.next(1.0)
+                        if not options:
+                            break
+                        next_waypoint = random.choice(options) if len(options) > 1 else options[0]
+                    elif self.town == "Town07":
                         if x < 650:
                             next_waypoint = current_waypoint.next(1.0)[0]
                         else:
@@ -175,6 +186,7 @@ class CarlaEnvironment():
                 self.sensor_list += [l.sensor for l in self.lidar_objs]
                 self.wait_for(lambda: self.lidar_objs[0].latest is not None)
 
+            self.prev_coop = {}  # motion features start at zero
             self.navigation_obs = np.concatenate([np.array([self.throttle, self.velocity, self.previous_steer, self.distance_from_center, self.angle]), self.coop_obs()])
 
                         
@@ -221,6 +233,7 @@ class CarlaEnvironment():
                 if COOP_SECTORS:  # second action: > 0 throttle, < 0 brake (upstream mapped [-1, 1] to throttle only)
                     a = max(min(float(action_idx[1]), 1.0), -1.0)
                     throttle, brake = max(a, 0.0), max(-a, 0.0)
+                    self.d_steer, self.d_pedal, self.prev_pedal = steer - self.previous_steer, a - self.prev_pedal, a
                 else:
                     throttle = float((action_idx[1] + 1.0)/2)
                     throttle = max(min(throttle, 1.0), 0.0)
@@ -325,6 +338,12 @@ class CarlaEnvironment():
                         reward = 1.0 * centering_factor * angle_factor 
                 else:
                     reward = 1.0 * centering_factor * angle_factor
+                if COOP_SECTORS and self.continous_action_space:
+                    red = self.traffic is not None and self.vehicle.is_at_traffic_light() and \
+                        self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red and self.velocity > 5
+                    self.red_moving = red
+                    reward -= safety_penalty(self.front_obstacle, self.last_sectors.min() * COOP_RANGE, self.velocity, red,
+                                             self.d_steer, self.d_pedal)
 
             if self.timesteps >= 7500:
                 done = True
@@ -545,23 +564,40 @@ class CarlaEnvironment():
                 t = time.time()
 
 
-    # Fuse the latest shared scans into [COOP_SECTORS] nearest-obstacle distances around the ego
+    # Coop observation: (sectors, corridor) now and their change since the last step, so the agent sees motion
     def coop_obs(self):
         if not COOP_SECTORS:
             return np.zeros(0)
+        return self._coop_vec(self.share, primary=True)
+
+    # The same features for the other sharing mode (no side effects on the env), recorded for the ablation
+    def coop_obs_other(self):
+        return self._coop_vec(not self.share, primary=False)
+
+    def _coop_vec(self, share, primary):
+        sectors, front = self.coop_features(share)
+        if primary:
+            self.front_obstacle, self.last_sectors = front, sectors
+            if front < 10:
+                self.last_blocked = self.now()
+        cur = np.append(sectors, min(front, COOP_CORRIDOR) / COOP_CORRIDOR)
+        prev = self.prev_coop.get(share, cur)
+        self.prev_coop[share] = cur
+        return np.concatenate([cur, cur - prev])
+
+    # Fuse the latest scans (all coop cars, or only the ego with share=False) into sector distances + lane obstacle
+    def coop_features(self, share):
         ego = self.lidar_objs[0]
-        scans = [l.latest for l in self.lidar_objs if l.latest is not None]
+        scans = [l.latest for l in (self.lidar_objs if share else self.lidar_objs[:1]) if l.latest is not None]
         ext = self.vehicle.bounding_box.extent
         clouds, poses, z = [s[0] for s in scans], [s[1] for s in scans], dict(z_min=-ego.height + 0.3, z_max=-ego.height + 2.0)
         sectors = sector_distances(clouds, poses, ego.latest[1], (ext.x + 0.3, ext.y + 0.3), COOP_SECTORS, COOP_RANGE, **z)
         i = self.current_waypoint_index + 3  # ~front bumper
         path = [(w.transform.location.x, w.transform.location.y, w.transform.location.z)
                 for w in self.route_waypoints[i:i + int(COOP_CORRIDOR) + 1]]
-        self.front_obstacle = corridor_distance(clouds, poses, path, ext.y + 0.3, z_min=0.3, z_max=1.5,
-                                                ego_pose=ego.latest[1], ego_half_extent=(ext.x + 0.3, ext.y + 0.3)) if len(path) > 1 else np.inf
-        if self.front_obstacle < 10:
-            self.last_blocked = self.now()
-        return np.append(sectors, min(self.front_obstacle, COOP_CORRIDOR) / COOP_CORRIDOR)
+        front = corridor_distance(clouds, poses, path, ext.y + 0.3, z_min=0.3, z_max=1.5,
+                                  ego_pose=ego.latest[1], ego_half_extent=(ext.x + 0.3, ext.y + 0.3)) if len(path) > 1 else np.inf
+        return sectors, front
 
 
     # Clean up method

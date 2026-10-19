@@ -75,3 +75,19 @@ def corridor_distance(clouds, poses, path, half_width, z_min, z_max, ego_pose=No
         hits.append(along[k[m]])
     hits = np.sort(np.concatenate(hits)) if hits else np.zeros(0)
     return hits[min_points - 1] if len(hits) >= min_points else np.inf
+
+
+def safety_penalty(front, side, speed, red_moving, d_steer, d_pedal):
+    '''
+    Extra per-step cost for dense, unpredictable traffic (subtracted from the upstream reward, coop mode only):
+    front: lane-corridor obstacle distance (m), side: nearest point around the ego (m), speed (km/h),
+    red_moving: driving into a red light, d_steer / d_pedal: change of the actions since the last step.
+    '''
+    pen = 0.0
+    if speed > 5 and front < 3:
+        pen += 0.5 * (3 - front) / 3  # near miss ahead: closing in with less than 3 m left
+    if speed > 5 and side < 1.0:
+        pen += 0.2  # squeezing past something at speed (crawling past bikes is fine)
+    if red_moving:
+        pen += 0.5
+    return pen + min(0.2, 0.1 * (abs(d_steer) + abs(d_pedal)))  # jerky driving

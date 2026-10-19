@@ -51,14 +51,16 @@ def collect(args):
     client, world = ClientConnection(args.town).setup()
     env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn)
     encode = EncodeState(LATENT_DIM)
-    obs_l, act_l, rew_l, done_l = [], [], [], []
+    obs_l, alt_l, act_l, rew_l, done_l = [], [], [], [], []
     while len(obs_l) < args.steps:
         observation = env.reset()
         if observation is None:
             continue
         ep_reward, done, stuck = 0.0, False, 0
+        alt = env.coop_obs_other()  # the same moment seen without sharing (ego LiDAR only), for the ablation
         while not done and len(obs_l) < args.steps:
             o = encode.process(observation).cpu().numpy()
+            o_alt = np.concatenate([o[:100], alt])
             a = expert_action(env)
             noisy = a + np.array([np.random.normal(0, args.noise), 0.0])  # execute noisy, label clean: data also covers recoveries
             result = env.step(noisy)
@@ -71,17 +73,20 @@ def collect(args):
             stuck = stuck + 1 if env.velocity < 1 else 0
             if stuck > 400:  # 20 s still (e.g. stuck traffic): give up this episode
                 done = True
-            obs_l.append(o); act_l.append(a); rew_l.append(reward); done_l.append(done)
+            if not done:
+                alt = env.coop_obs_other()
+            obs_l.append(o); alt_l.append(o_alt); act_l.append(a); rew_l.append(reward); done_l.append(done)
             ep_reward += reward
         if done_l:
             done_l[-1] = True  # cut an unfinished episode for the return computation
-        save(args.town, obs_l, act_l, rew_l, done_l)  # every episode, so stopping early keeps the data
+        save(args.town, obs_l, alt_l, act_l, rew_l, done_l)  # every episode, so stopping early keeps the data
         print(f'collected {len(obs_l)} steps (saved), episode reward {ep_reward:.1f}, distance {info[0] if done else "-"}', flush=True)
 
 
-def save(town, obs_l, act_l, rew_l, done_l):
+def save(town, obs_l, alt_l, act_l, rew_l, done_l):
     os.makedirs('data', exist_ok=True)
-    np.savez_compressed(DATA.format(town), obs=np.array(obs_l, np.float32), act=np.array(act_l, np.float32),
+    np.savez_compressed(DATA.format(town), obs=np.array(obs_l, np.float32), obs_alt=np.array(alt_l, np.float32),
+                        act=np.array(act_l, np.float32),
                         rew=np.array(rew_l, np.float32), done=np.array(done_l))
 
 
@@ -98,7 +103,7 @@ def discounted_returns(rew, done, gamma):
 
 def train(args):
     d = np.load(DATA.format(args.town))
-    obs, act = torch.tensor(d['obs']), torch.tensor(d['act'])
+    obs, act = torch.tensor(d['obs_alt' if args.noshare else 'obs']), torch.tensor(d['act'])
     ret = discounted_returns(d['rew'], d['done'], GAMMA)
     ret = torch.tensor((ret - ret.mean()) / (ret.std() + 1e-7))  # PPO normalizes its critic targets the same way
     assert obs.shape[1] == 100 + COOP_OBS, 'data was collected with another COOP_SECTORS/COOP_OBS, collect again'
@@ -115,6 +120,10 @@ def train(args):
             with torch.no_grad():
                 print(f'epoch {epoch}: val actor mse {mse(policy.actor(obs[val]), act[val]):.4f}, '
                       f'val critic mse {mse(policy.critic(obs[val]).squeeze(-1), ret[val]):.4f}', flush=True)
+    if args.noshare:  # ablation model: evaluated with `evaluate.py --no-share`, never fine-tuned
+        os.makedirs(f'preTrained_models/ppo_coop_noshare/{args.town}', exist_ok=True)
+        torch.save(policy.state_dict(), f'preTrained_models/ppo_coop_noshare/{args.town}/bc_policy.pth')
+        return print(f'saved no-share BC policy to preTrained_models/ppo_coop_noshare/{args.town}/bc_policy.pth')
     # Become the only/latest checkpoint so `--load-checkpoint True` / `--train False` pick it up
     model_dir, meta_dir = PPO_CHECKPOINT_DIR + args.town, f'checkpoints/PPO_coop/{args.town}'
     os.makedirs(model_dir, exist_ok=True); os.makedirs(meta_dir, exist_ok=True)
@@ -133,6 +142,7 @@ if __name__ == '__main__':
     p.add_argument('--steps', type=int, default=40000)
     p.add_argument('--noise', type=float, default=0.2, help='steer noise std while collecting')
     p.add_argument('--vn', action='store_true', help='collect in chaotic Vietnamese-style traffic (use with --town Town02)')
+    p.add_argument('--noshare', action='store_true', help='train: use the ego-only LiDAR observations (ablation)')
     p.add_argument('--no-scenarios', dest='scenarios', action='store_false', help='no pedestrians / slow cars while collecting')
     p.add_argument('--epochs', type=int, default=30)
     p.add_argument('--action-std', type=float, default=0.05, help='PPO exploration for the fine-tune, small to keep the BC behaviour')

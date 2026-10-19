@@ -49,8 +49,12 @@ class VNTraffic:
             c.go_to_location(world.get_random_location_from_navigation())
             c.set_max_speed(self.rng.uniform(1.0, 2.2))  # some walk, some hurry
         self.lights = [(tl, _stop_waypoint(self.map, tl)) for tl in world.get_actors().filter('traffic.traffic_light')]
+        for tl, _ in self.lights:  # default cycle keeps each light red ~39 s; ~16 s keeps the traffic moving
+            tl.set_green_time(4.0)
+            tl.set_yellow_time(1.5)
         self.swarm = {}  # vehicle id -> (light id, cells) for vehicles packed in front of a red light
         self.ticks = self.rescued = 0
+        self.stall = {}  # vehicle id -> ticks standing still without a reason
         self.chaos = 5.0  # mean seconds between random surprise events near the ego, 0 = off
         self.next_event = int(self.chaos / DT)
         self.log = []  # event names for the dashboard
@@ -109,14 +113,22 @@ class VNTraffic:
     def _rescue(self, env):
         """Safety net: a vehicle knocked over or launched off the road is put back on a free lane spot."""
         occupied = [o for _, o in env.vehicle_locs]
+        riding = {r.v.id for r in env.riders if r.v}
+        far = self._near_ego_slots(env, 40, 90) or self.slots
         for a in self.world.get_actors().filter('vehicle.*'):
             if a.id == env.vehicle.id:
                 continue
             t = a.get_transform()
             wp = self.map.get_waypoint(t.location)
-            if abs(t.rotation.pitch) < 35 and abs(t.rotation.roll) < 35 and t.location.z - wp.transform.location.z < 1.5:
+            vel = a.get_velocity()
+            waiting = a.id in self.swarm or a.id in riding or (
+                a.is_at_traffic_light() and a.get_traffic_light_state() != carla.TrafficLightState.Green)
+            self.stall[a.id] = self.stall.get(a.id, 0) + 10 if (vel.x ** 2 + vel.y ** 2) < 0.25 and not waiting else 0
+            stuck = self.stall[a.id] > 400  # 20 s still for no reason (TM dead end, wedged between bikes)
+            if not stuck and abs(t.rotation.pitch) < 35 and abs(t.rotation.roll) < 35 and t.location.z - wp.transform.location.z < 1.5:
                 continue
-            for tr in self.rng.sample(self.slots, 20):
+            self.stall[a.id] = 0
+            for tr in self.rng.sample(far, min(20, len(far))):
                 if all(tr.location.distance(o) > 5 for o in occupied):
                     a.set_transform(carla.Transform(tr.location + carla.Location(z=0.3), tr.rotation))
                     a.set_target_velocity(carla.Vector3D())
@@ -256,6 +268,7 @@ class Rider:
         '''vehicle=None spawns a new motorbike (dies with the episode); else takes over that vehicle from the TM.'''
         self.env, self.wp, self.plan, self.life, self.t, self.v = env, wp, plan, life, 0.0, vehicle
         self.last_control = None
+        self.merging = False
         if vehicle is None:
             bp = env.world.get_blueprint_library().find(random.choice(MOTORBIKES))
             tr = carla.Transform(_offset(wp, plan(self)[0]) + carla.Location(z=0.5), wp.transform.rotation)
@@ -285,8 +298,11 @@ class Rider:
         if self.v is None or not self.v.is_alive:
             return False
         if self.t > self.life:
-            self.v.set_autopilot(True, 8000)
-            return False
+            if not self.merging:  # 3 s back to the lane centre first: the TM strands vehicles it finds off the lane
+                self.merging, self.life, self.plan = True, self.life + 3.0, lambda r: (0.0, 18.0)
+            else:
+                self.v.set_autopilot(True, 8000)
+                return False
         loc = self.v.get_location()
         for _ in range(20):  # advance the reference waypoint along its lane
             f, d = self.wp.transform.get_forward_vector(), loc - self.wp.transform.location
@@ -428,7 +444,7 @@ def flock(env):
 def surround(env):
     """Motorbikes box the ego in on all sides and hold the formation ~10 s before drifting off ahead."""
     riders = []
-    for along, lat in ((5.5, -0.3), (5.0, 1.8), (0.5, -2.3), (0.0, 2.3), (-2.5, -2.3), (-5.5, 0.3), (-5.0, 1.9)):
+    for along, lat in ((7.5, -0.3), (7.0, 1.8), (0.5, -2.3), (0.0, 2.3), (-2.5, -2.3), (-5.5, 0.3), (-5.0, 1.9)):
         wp = _ego_lane(env, along) if along else env.map.get_waypoint(env.vehicle.get_location())
         if not wp:
             continue
@@ -437,7 +453,8 @@ def surround(env):
             if r.t > 10:  # break up: everybody overtakes and leaves, keeping its side so nobody cuts into the ego
                 return lat, max(20.0, env.velocity + 10)
             a = _ahead_of_ego(env, r.v) if r.v else along
-            return lat, max(0.0, min(25.0, env.velocity + 2.0 * (along - a)))  # keep its place around the ego
+            speed = max(0.0, min(25.0, env.velocity + 2.0 * (along - a)))  # keep its place around the ego
+            return lat, max(5.0, speed) if along > 3 else speed  # the bikes in front keep drifting on, so the ego can creep after them
         r = Rider(env, wp, plan, life=14)
         if r:
             riders.append(r)

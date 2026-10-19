@@ -46,6 +46,15 @@ Shortcut "Coop-Drive VN Traffic". `simulation/vn_traffic.py`:
 - Xe do script lái tự giữ khoảng cách theo kích thước xe; xe nào lật/bay được đặt lại trên đường; hybrid physics cho xe ở xa (> 70 m).
 - Train/thu dữ liệu trong môi trường này: `bc.py collect --town Town02 --vn`, `continuous_driver.py --town Town02 --vn-traffic`. Chạy khoảng 6–7 bước/giây với dashboard.
 
+### Reward, observation và đánh giá (chế độ coop)
+
+- Observation coop = (16 hướng + hành lang) **và độ thay đổi của chúng so với bước trước**, để agent thấy xe nào đang lao tới: 100 + 34 = 134 chiều.
+- Reward = reward gốc − `safety_penalty`: suýt va chạm (vật cản trong làn < 3 m khi đang chạy), lách sát < 1 m khi đang chạy, đi vào đèn đỏ (chế độ VN), lái giật.
+- Chế độ VN: tuyến ngẫu nhiên mỗi episode, chu kỳ đèn ngắn hơn (đỏ ~16 s).
+- `share=False` / `--no-share`: chỉ dùng LiDAR của ego, để so sánh có/không có LiDAR hợp tác. `bc.py collect` ghi cả hai bản observation, `bc.py train --noshare` train model đối chứng.
+- `evaluate.py`: seed cố định, policy lái tất định; ghi `results/<tên>.json` (tỉ lệ hoàn thành tuyến, va chạm/km, giây suýt va chạm/km, vượt đèn đỏ/km, tốc độ, độ giật).
+- `sh pipeline_vn.sh`: thu dữ liệu VN → BC chia sẻ + chỉ ego → đánh giá → fine-tune PPO → đánh giá.
+
 Dọn xe/sensor sót lại sau một lần crash: `venv\Scripts\python clean_world.py`. Cả chuỗi thu dữ liệu → BC → fine-tune: `sh pipeline.sh`.
 
 Model coop lưu ở `preTrained_models/ppo_coop/<Town>/`, metadata lưu ở `checkpoints/PPO_coop/<Town>/`, log TensorBoard ở `runs/`.

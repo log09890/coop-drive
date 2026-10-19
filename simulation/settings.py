@@ -17,7 +17,7 @@ EPISODE_LENGTH = 120
 NUMBER_OF_VEHICLES = 30
 NUMBER_OF_PEDESTRIAN = 10
 CONTINUOUS_ACTION = True
-VISUAL_DISPLAY = True
+VISUAL_DISPLAY = False  # upstream pygame chase view; dashboard.py replaces it
 
 
 RGB_CAMERA = 'sensor.camera.rgb'
@@ -30,7 +30,7 @@ COOP_SECTORS = 16
 COOP_VEHICLES = 5
 COOP_RANGE = 50.0
 COOP_CORRIDOR = 20.0  # lane-ahead obstacle check length (m), one extra obs value
-COOP_OBS = COOP_SECTORS + 1 if COOP_SECTORS else 0  # sectors + corridor distance
+COOP_OBS = 2 * (COOP_SECTORS + 1) if COOP_SECTORS else 0  # (sectors + corridor) now, and their change since the last step
 LIDAR_CHANNELS = 32
 LIDAR_LOWER_FOV = -25.0
 LIDAR_POINTS_PER_SECOND = 100000
