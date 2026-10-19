@@ -1,6 +1,7 @@
 import sys
 import torch
 from autoencoder.encoder import VariationalEncoder
+from parameters import COOP_SECTORS, IM_HEIGHT, IM_WIDTH
 
 class EncodeState():
     def __init__(self, latent_dim):
@@ -20,8 +21,13 @@ class EncodeState():
     
     def process(self, observation):
         image_obs = torch.tensor(observation[0], dtype=torch.float).to(self.device)
-        image_obs = image_obs.unsqueeze(0)
-        image_obs = image_obs.permute(0,3,2,1)
+        if COOP_SECTORS:
+            # Upstream fed the VAE a (W,H)-scrambled BGR 0..255 frame, which sometimes overflows exp(sigma) to inf/NaN.
+            # Give it what vae.py trained on (ToTensor: RGB, 0..1, CHW). The buffer order is intact, so reshape restores the image.
+            image_obs = image_obs.reshape(IM_HEIGHT, IM_WIDTH, 3)[..., [2, 1, 0]].permute(2, 0, 1).unsqueeze(0) / 255.0
+        else:  # keep the old input so the upstream pretrained PPO still sees what it was trained on
+            image_obs = image_obs.unsqueeze(0)
+            image_obs = image_obs.permute(0,3,2,1)
         image_obs = self.conv_encoder(image_obs)
         navigation_obs = torch.tensor(observation[1], dtype=torch.float).to(self.device)
         observation = torch.cat((image_obs.view(-1), navigation_obs), -1)

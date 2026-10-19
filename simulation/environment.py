@@ -1,9 +1,11 @@
 import time
+import traceback
 import random
 import numpy as np
 import pygame
 from simulation.connection import carla
-from simulation.sensors import CameraSensor, CameraSensorEnv, CollisionSensor
+from simulation.sensors import CameraSensor, CameraSensorEnv, CollisionSensor, LidarSensor
+from simulation.coop import sector_distances, corridor_distance
 from simulation.settings import *
 
 
@@ -33,6 +35,9 @@ class CarlaEnvironment():
         self.env_camera_obj = None
         self.collision_obj = None
         self.lane_invasion_obj = None
+        self.lidar_objs = list()
+        self.front_obstacle = np.inf
+        self.last_blocked = 0.0
 
         # Two very important lists for keeping track of our actors and their observations.
         self.sensor_list = list()
@@ -74,8 +79,7 @@ class CarlaEnvironment():
 
             # Camera Sensor
             self.camera_obj = CameraSensor(self.vehicle)
-            while(len(self.camera_obj.front_camera) == 0):
-                time.sleep(0.0001)
+            self.wait_for(lambda: len(self.camera_obj.front_camera))
             self.image_obs = self.camera_obj.front_camera.pop(-1)
             self.sensor_list.append(self.camera_obj.sensor)
 
@@ -137,16 +141,38 @@ class CarlaEnvironment():
                 self.vehicle.set_transform(transform)
                 self.current_waypoint_index = self.checkpoint_waypoint_index
 
-            self.navigation_obs = np.array([self.throttle, self.velocity, self.previous_steer, self.distance_from_center, self.angle])
+            # Cooperative cars (CODD): autopilot NPCs around the ego, each sharing its lidar scan
+            if COOP_SECTORS:
+                self.lidar_objs.append(LidarSensor(self.vehicle))
+                spawn_points = [sp for sp in self.map.get_spawn_points() if sp.location.distance(transform.location) < COOP_RANGE]
+                random.shuffle(spawn_points)
+                for sp in spawn_points[:COOP_VEHICLES]:
+                    car = self.world.try_spawn_actor(random.choice(self.blueprint_library.filter('vehicle.*')), sp)
+                    if car is None:
+                        continue
+                    car.set_autopilot(True)
+                    tm = self.client.get_trafficmanager(8000)
+                    tm.ignore_signs_percentage(car, 100)  # 0.9.10 TM can wait forever at Town07 stop signs and block the route
+                    tm.ignore_lights_percentage(car, 100)
+                    self.actor_list.append(car)
+                    self.lidar_objs.append(LidarSensor(car))
+                self.sensor_list += [l.sensor for l in self.lidar_objs]
+                self.wait_for(lambda: self.lidar_objs[0].latest is not None)
+
+            self.navigation_obs = np.concatenate([np.array([self.throttle, self.velocity, self.previous_steer, self.distance_from_center, self.angle]), self.coop_obs()])
 
                         
             time.sleep(0.5)
+            if COOP_SECTORS:
+                for _ in range(10):  # let the spawned cars settle
+                    self.world.tick()
             self.collision_history.clear()
 
             self.episode_start_time = time.time()
             return [self.image_obs, self.navigation_obs]
 
         except:
+            traceback.print_exc()
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list])
@@ -176,9 +202,14 @@ class CarlaEnvironment():
             if self.continous_action_space:
                 steer = float(action_idx[0])
                 steer = max(min(steer, 1.0), -1.0)
-                throttle = float((action_idx[1] + 1.0)/2)
-                throttle = max(min(throttle, 1.0), 0.0)
-                self.vehicle.apply_control(carla.VehicleControl(steer=self.previous_steer*0.9 + steer*0.1, throttle=self.throttle*0.9 + throttle*0.1))
+                if COOP_SECTORS:  # second action: > 0 throttle, < 0 brake (upstream mapped [-1, 1] to throttle only)
+                    a = max(min(float(action_idx[1]), 1.0), -1.0)
+                    throttle, brake = max(a, 0.0), max(-a, 0.0)
+                else:
+                    throttle = float((action_idx[1] + 1.0)/2)
+                    throttle = max(min(throttle, 1.0), 0.0)
+                    brake = 0.0
+                self.vehicle.apply_control(carla.VehicleControl(steer=self.previous_steer*0.9 + steer*0.1, throttle=self.throttle*0.9 + throttle*0.1, brake=brake))
                 self.previous_steer = steer
                 self.throttle = throttle
             else:
@@ -189,6 +220,8 @@ class CarlaEnvironment():
                     self.vehicle.apply_control(carla.VehicleControl(steer=self.previous_steer*0.9 + steer*0.1))
                 self.previous_steer = steer
                 self.throttle = 1.0
+            if COOP_SECTORS:
+                self.world.tick()
             
             # Traffic Light state
             if self.vehicle.is_at_traffic_light():
@@ -246,7 +279,7 @@ class CarlaEnvironment():
             elif self.distance_from_center > self.max_distance_from_center:
                 done = True
                 reward = -10
-            elif self.episode_start_time + 10 < time.time() and self.velocity < 1.0:
+            elif max(self.episode_start_time, self.last_blocked) + 10 < time.time() and self.velocity < 1.0:  # stopping for an obstacle (and 10 s after it clears) is fine
                 reward = -10
                 done = True
             elif self.velocity > self.max_speed:
@@ -281,31 +314,29 @@ class CarlaEnvironment():
                         self.checkpoint_frequency = None
                         self.checkpoint_waypoint_index = 0
 
-            while(len(self.camera_obj.front_camera) == 0):
-                time.sleep(0.0001)
+            self.wait_for(lambda: len(self.camera_obj.front_camera))
 
             self.image_obs = self.camera_obj.front_camera.pop(-1)
             normalized_velocity = self.velocity/self.target_speed
             normalized_distance_from_center = self.distance_from_center / self.max_distance_from_center
             normalized_angle = abs(self.angle / np.deg2rad(20))
-            self.navigation_obs = np.array([self.throttle, self.velocity, normalized_velocity, normalized_distance_from_center, normalized_angle])
+            self.navigation_obs = np.concatenate([np.array([self.throttle, self.velocity, normalized_velocity, normalized_distance_from_center, normalized_angle]), self.coop_obs()])
             
             # Remove everything that has been spawned in the env
             if done:
                 self.center_lane_deviation = self.center_lane_deviation / self.timesteps
                 self.distance_covered = abs(self.current_waypoint_index - self.checkpoint_waypoint_index)
                 
-                for sensor in self.sensor_list:
-                    sensor.destroy()
-                
+                # batch destroy: destroying Traffic Manager cars one by one aborts the 0.9.10 client
+                self.client.apply_batch_sync([carla.command.DestroyActor(x) for x in self.sensor_list + self.actor_list], bool(COOP_SECTORS))
+                self.sensor_list.clear()
+                self.actor_list.clear()
                 self.remove_sensors()
-                
-                for actor in self.actor_list:
-                    actor.destroy()
             
             return [self.image_obs, self.navigation_obs], reward, done, [self.distance_covered, self.center_lane_deviation]
 
         except:
+            traceback.print_exc()
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.sensor_list])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.actor_list])
             self.client.apply_batch([carla.command.DestroyActor(x) for x in self.walker_list])
@@ -359,6 +390,8 @@ class CarlaEnvironment():
                         walker_controller_bp, carla.Transform(), walker)
                     self.walker_list.append(walker_controller.id)
                     self.walker_list.append(walker.id)
+            if COOP_SECTORS:
+                self.world.tick()  # walkers only exist (and their controllers can start) after a tick
             all_actors = self.world.get_actors(self.walker_list)
 
             # set how many pedestrians can cross the road
@@ -473,8 +506,38 @@ class CarlaEnvironment():
         self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
 
 
+    # Wait for sensor data; in sync mode (coop) the sim only moves when we tick
+    def wait_for(self, ready):
+        t = time.time()
+        while not ready():
+            time.sleep(0.0001)
+            if COOP_SECTORS and time.time() - t > 0.05:
+                self.world.tick()
+                t = time.time()
+
+
+    # Fuse the latest shared scans into [COOP_SECTORS] nearest-obstacle distances around the ego
+    def coop_obs(self):
+        if not COOP_SECTORS:
+            return np.zeros(0)
+        ego = self.lidar_objs[0]
+        scans = [l.latest for l in self.lidar_objs if l.latest is not None]
+        ext = self.vehicle.bounding_box.extent
+        clouds, poses, z = [s[0] for s in scans], [s[1] for s in scans], dict(z_min=-ego.height + 0.3, z_max=-ego.height + 2.0)
+        sectors = sector_distances(clouds, poses, ego.latest[1], (ext.x + 0.3, ext.y + 0.3), COOP_SECTORS, COOP_RANGE, **z)
+        i = self.current_waypoint_index + 3  # ~front bumper
+        path = [(w.transform.location.x, w.transform.location.y, w.transform.location.z)
+                for w in self.route_waypoints[i:i + int(COOP_CORRIDOR) + 1]]
+        self.front_obstacle = corridor_distance(clouds, poses, path, ext.y + 0.3, z_min=0.3, z_max=1.5,
+                                                ego_pose=ego.latest[1], ego_half_extent=(ext.x + 0.3, ext.y + 0.3)) if len(path) > 1 else np.inf
+        if self.front_obstacle < 10:
+            self.last_blocked = time.time()
+        return np.append(sectors, min(self.front_obstacle, COOP_CORRIDOR) / COOP_CORRIDOR)
+
+
     # Clean up method
     def remove_sensors(self):
+        self.lidar_objs = list()
         self.camera_obj = None
         self.collision_obj = None
         self.lane_invasion_obj = None

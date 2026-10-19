@@ -1,5 +1,6 @@
 import os
 import sys
+import traceback
 import time
 import random
 import numpy as np
@@ -54,6 +55,9 @@ def runner():
     exp_name = args.exp_name
     train = args.train
     town = args.town
+    chkpt_dir = f'checkpoints/PPO{"_coop" if COOP_SECTORS else ""}/{town}'  # coop runs keep their own counters
+    os.makedirs(chkpt_dir, exist_ok=True)
+    os.makedirs(PPO_CHECKPOINT_DIR + town, exist_ok=True)
     checkpoint_load = args.load_checkpoint
     total_timesteps = args.total_timesteps
     action_std_init = args.action_std_init
@@ -123,8 +127,8 @@ def runner():
         time.sleep(0.5)
         
         if checkpoint_load:
-            chkt_file_nums = len(next(os.walk(f'checkpoints/PPO/{town}'))[2]) - 1
-            chkpt_file = f'checkpoints/PPO/{town}/checkpoint_ppo_'+str(chkt_file_nums)+'.pickle'
+            chkt_file_nums = len(next(os.walk(f'{chkpt_dir}'))[2]) - 1
+            chkpt_file = f'{chkpt_dir}/checkpoint_ppo_'+str(chkt_file_nums)+'.pickle'
             with open(chkpt_file, 'rb') as f:
                 data = pickle.load(f)
                 episode = data['episode']
@@ -198,10 +202,10 @@ def runner():
                 if episode % 10 == 0:
                     agent.learn()
                     agent.chkpt_save()
-                    chkt_file_nums = len(next(os.walk(f'checkpoints/PPO/{town}'))[2])
+                    chkt_file_nums = len(next(os.walk(f'{chkpt_dir}'))[2])
                     if chkt_file_nums != 0:
                         chkt_file_nums -=1
-                    chkpt_file = f'checkpoints/PPO/{town}/checkpoint_ppo_'+str(chkt_file_nums)+'.pickle'
+                    chkpt_file = f'{chkpt_dir}/checkpoint_ppo_'+str(chkt_file_nums)+'.pickle'
                     data_obj = {'cumulative_score': cumulative_score, 'episode': episode, 'timestep': timestep, 'action_std_init': action_std_init}
                     with open(chkpt_file, 'wb') as handle:
                         pickle.dump(data_obj, handle)
@@ -228,8 +232,8 @@ def runner():
                 if episode % 100 == 0:
                     
                     agent.save()
-                    chkt_file_nums = len(next(os.walk(f'checkpoints/PPO/{town}'))[2])
-                    chkpt_file = f'checkpoints/PPO/{town}/checkpoint_ppo_'+str(chkt_file_nums)+'.pickle'
+                    chkt_file_nums = len(next(os.walk(f'{chkpt_dir}'))[2])
+                    chkpt_file = f'{chkpt_dir}/checkpoint_ppo_'+str(chkt_file_nums)+'.pickle'
                     data_obj = {'cumulative_score': cumulative_score, 'episode': episode, 'timestep': timestep, 'action_std_init': action_std_init}
                     with open(chkpt_file, 'wb') as handle:
                         pickle.dump(data_obj, handle)
@@ -288,6 +292,8 @@ def runner():
             print("Terminating the run.")
             sys.exit()
 
+    except Exception:
+        traceback.print_exc()
     finally:
         sys.exit()
 

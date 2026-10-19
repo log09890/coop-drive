@@ -34,5 +34,6 @@ TOTAL_TIMESTEPS = 2e6
 ACTION_STD_INIT = 0.2
 TEST_TIMESTEPS = 5e4
 PPO_LEARNING_RATE = 1e-4  
-PPO_CHECKPOINT_DIR = 'preTrained_models/ppo/'
+from simulation.settings import COOP_SECTORS, COOP_OBS
+PPO_CHECKPOINT_DIR = 'preTrained_models/ppo_coop/' if COOP_SECTORS else 'preTrained_models/ppo/'  # different obs size, keep models apart
 POLICY_CLIP = 0.2

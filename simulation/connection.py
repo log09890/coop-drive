@@ -11,7 +11,7 @@ except IndexError:
     print('Couldn\'t import Carla egg properly')
 
 import carla
-from simulation.settings import PORT, TIMEOUT, HOST
+from simulation.settings import PORT, TIMEOUT, HOST, COOP_SECTORS
 
 class ClientConnection:
     def __init__(self, town):
@@ -26,6 +26,12 @@ class ClientConnection:
             self.client.set_timeout(TIMEOUT)
             self.world = self.client.load_world(self.town)
             self.world.set_weather(carla.WeatherParameters.CloudyNoon)
+            # Coop cars use the Traffic Manager, which is only stable in synchronous mode (as in CODD)
+            settings = self.world.get_settings()
+            settings.synchronous_mode = bool(COOP_SECTORS)
+            settings.fixed_delta_seconds = 0.05 if COOP_SECTORS else None
+            self.world.apply_settings(settings)
+            self.client.get_trafficmanager(8000).set_synchronous_mode(bool(COOP_SECTORS))
             return self.client, self.world
 
         except Exception as e:

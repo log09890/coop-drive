@@ -23,3 +23,14 @@ VISUAL_DISPLAY = True
 RGB_CAMERA = 'sensor.camera.rgb'
 SSC_CAMERA = 'sensor.camera.semantic_segmentation'
 
+
+
+# Cooperative lidar (CODD-style). COOP_SECTORS = 0 turns it off and keeps the original 100-dim obs (pretrained PPO).
+COOP_SECTORS = 16
+COOP_VEHICLES = 5
+COOP_RANGE = 50.0
+COOP_CORRIDOR = 20.0  # lane-ahead obstacle check length (m), one extra obs value
+COOP_OBS = COOP_SECTORS + 1 if COOP_SECTORS else 0  # sectors + corridor distance
+LIDAR_CHANNELS = 32
+LIDAR_LOWER_FOV = -25.0
+LIDAR_POINTS_PER_SECOND = 100000

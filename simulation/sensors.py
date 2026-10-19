@@ -3,7 +3,7 @@ import numpy as np
 import weakref
 import pygame
 from simulation.connection import carla
-from simulation.settings import RGB_CAMERA, SSC_CAMERA
+from simulation.settings import RGB_CAMERA, SSC_CAMERA, COOP_RANGE, LIDAR_CHANNELS, LIDAR_LOWER_FOV, LIDAR_POINTS_PER_SECOND
 
 
 # ---------------------------------------------------------------------|
@@ -124,3 +124,42 @@ class CollisionSensor:
         intensity = math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
         self.collision_data.append(intensity)
 
+
+
+# ---------------------------------------------------------------------|
+# ------------------------------- LIDAR (CODD-style, shared over V2V) |
+# ---------------------------------------------------------------------|
+
+class LidarSensor:
+
+    def __init__(self, vehicle) -> None:
+        self.parent = vehicle
+        self.latest = None  # (points [N,4] in sensor frame, sensor pose x,y,z,pitch,yaw,roll)
+        world = self.parent.get_world()
+        ext = vehicle.bounding_box.extent
+        # CODD: lift the lidar so the lower fov never hits the own roof
+        self.height = 2 * ext.z + max(ext.x, ext.y) * np.tan(np.radians(-LIDAR_LOWER_FOV))
+        self.sensor = self._set_lidar_sensor(world)
+        weak_self = weakref.ref(self)
+        self.sensor.listen(lambda data: LidarSensor._on_scan(weak_self, data))
+
+    def _set_lidar_sensor(self, world) -> object:
+        lidar_bp = world.get_blueprint_library().find('sensor.lidar.ray_cast')
+        lidar_bp.set_attribute('dropoff_general_rate', '0.0')
+        lidar_bp.set_attribute('dropoff_intensity_limit', '1.0')
+        lidar_bp.set_attribute('dropoff_zero_intensity', '0.0')
+        lidar_bp.set_attribute('channels', str(LIDAR_CHANNELS))
+        lidar_bp.set_attribute('lower_fov', str(LIDAR_LOWER_FOV))
+        lidar_bp.set_attribute('range', str(COOP_RANGE))
+        lidar_bp.set_attribute('points_per_second', str(LIDAR_POINTS_PER_SECOND))
+        lidar_bp.set_attribute('rotation_frequency', '20')  # one full turn per 0.05 s sync tick
+        return world.spawn_actor(lidar_bp, carla.Transform(carla.Location(z=self.height)), attach_to=self.parent)
+
+    @staticmethod
+    def _on_scan(weak_self, data):
+        self = weak_self()
+        if not self:
+            return
+        points = np.frombuffer(data.raw_data, dtype=np.dtype('f4')).reshape(-1, 4).copy()
+        t = data.transform
+        self.latest = (points, (t.location.x, t.location.y, t.location.z, t.rotation.pitch, t.rotation.yaw, t.rotation.roll))

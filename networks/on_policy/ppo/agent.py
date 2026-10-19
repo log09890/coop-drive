@@ -29,7 +29,7 @@ class PPOAgent(object):
     def __init__(self, town, action_std_init=0.4):
         
         #self.env = env
-        self.obs_dim = 100
+        self.obs_dim = 100 + COOP_OBS
         self.action_dim = 2
         self.clip = POLICY_CLIP
         self.gamma = GAMMA

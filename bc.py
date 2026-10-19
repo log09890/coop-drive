@@ -1,0 +1,137 @@
+'''
+Behavior cloning warm start for the coop PPO agent.
+
+  python bc.py collect --steps 40000   # expert follows the route waypoints, records (obs, action)
+  python bc.py train                   # fit actor (and critic) on it, write it as the latest PPO checkpoint
+  python continuous_driver.py --exp-name ppo --load-checkpoint True   # PPO fine-tune from the BC policy
+'''
+import argparse
+import math
+import os
+import pickle
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+from encoder_init import EncodeState
+from networks.on_policy.ppo.ppo import ActorCritic
+from parameters import LATENT_DIM, GAMMA, COOP_OBS, PPO_CHECKPOINT_DIR
+
+DATA = 'data/bc_{}.npz'
+
+
+def expert_action(env, lookahead=6):
+    '''Pure pursuit on the route + stop for what the LiDAR sees in the lane; action in PPO space (steer, throttle>0 / brake<0).'''
+    wps = env.route_waypoints
+    target = wps[min(env.current_waypoint_index + lookahead, len(wps) - 1)].transform.location
+    t = env.vehicle.get_transform()
+    fwd = t.get_forward_vector()
+    angle = math.atan2(target.y - t.location.y, target.x - t.location.x) - math.atan2(fwd.y, fwd.x)
+    angle = (angle + math.pi) % (2 * math.pi) - math.pi  # left-handed UE4: positive = target on the right = steer right
+    steer = float(np.clip(1.5 * angle, -1, 1))
+    # reward peaks at 15-22 km/h (>25 ends the episode); slow down linearly to a stop 7 m before an obstacle in the lane
+    # shortcut: the corridor is straight ahead, so in sharp curves it can miss/catch things; use the route waypoints if that matters
+    target_speed = min(20.0, max(0.0, (env.front_obstacle - 7.0) * 1.5))
+    if target_speed < 1:
+        pedal = -1.0
+    elif env.velocity > target_speed + 2:
+        pedal = -float(np.clip(0.15 * (env.velocity - target_speed), 0.2, 1))
+    else:
+        pedal = float(np.clip(0.4 + 0.15 * (target_speed - env.velocity), 0, 1))
+    return np.array([steer, pedal])
+
+
+def collect(args):
+    from simulation.connection import ClientConnection
+    from simulation.environment import CarlaEnvironment
+    from simulation.scenarios import spawn_scenario
+    client, world = ClientConnection(args.town).setup()
+    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None)
+    encode = EncodeState(LATENT_DIM)
+    obs_l, act_l, rew_l, done_l = [], [], [], []
+    while len(obs_l) < args.steps:
+        observation = env.reset()
+        if observation is None:
+            continue
+        ep_reward, done, stuck = 0.0, False, 0
+        while not done and len(obs_l) < args.steps:
+            o = encode.process(observation).cpu().numpy()
+            a = expert_action(env)
+            noisy = a + np.array([np.random.normal(0, args.noise), 0.0])  # execute noisy, label clean: data also covers recoveries
+            result = env.step(noisy)
+            if result is None:  # env crashed and cleaned up, start a new episode
+                break
+            observation, reward, done, info = result
+            # traffic to brake for (pedestrian crossing or slow car ahead), only on a clear road so obstacles do not pile up
+            if args.scenarios and env.timesteps % 250 == 0 and env.front_obstacle == np.inf and env.velocity > 10:
+                spawn_scenario(env, random.choice([1, 2]))
+            stuck = stuck + 1 if env.velocity < 1 else 0
+            if stuck > 400:  # 20 s still (e.g. stuck traffic): give up this episode
+                done = True
+            obs_l.append(o); act_l.append(a); rew_l.append(reward); done_l.append(done)
+            ep_reward += reward
+        if done_l:
+            done_l[-1] = True  # cut an unfinished episode for the return computation
+        save(args.town, obs_l, act_l, rew_l, done_l)  # every episode, so stopping early keeps the data
+        print(f'collected {len(obs_l)} steps (saved), episode reward {ep_reward:.1f}, distance {info[0] if done else "-"}', flush=True)
+
+
+def save(town, obs_l, act_l, rew_l, done_l):
+    os.makedirs('data', exist_ok=True)
+    np.savez_compressed(DATA.format(town), obs=np.array(obs_l, np.float32), act=np.array(act_l, np.float32),
+                        rew=np.array(rew_l, np.float32), done=np.array(done_l))
+
+
+def discounted_returns(rew, done, gamma):
+    '''Same Monte Carlo targets PPOAgent.learn uses for its critic (before normalization).'''
+    out, g = np.zeros_like(rew), 0.0
+    for i in reversed(range(len(rew))):
+        if done[i]:
+            g = 0.0
+        g = rew[i] + gamma * g
+        out[i] = g
+    return out
+
+
+def train(args):
+    d = np.load(DATA.format(args.town))
+    obs, act = torch.tensor(d['obs']), torch.tensor(d['act'])
+    ret = discounted_returns(d['rew'], d['done'], GAMMA)
+    ret = torch.tensor((ret - ret.mean()) / (ret.std() + 1e-7))  # PPO normalizes its critic targets the same way
+    assert obs.shape[1] == 100 + COOP_OBS, 'data was collected with another COOP_SECTORS/COOP_OBS, collect again'
+    policy = ActorCritic(obs.shape[1], 2, args.action_std)
+    opt = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    idx = torch.randperm(len(obs))
+    val, tr = idx[:len(idx) // 10], idx[len(idx) // 10:]
+    mse = nn.MSELoss()
+    for epoch in range(args.epochs):
+        for b in tr[torch.randperm(len(tr))].split(256):
+            loss = mse(policy.actor(obs[b]), act[b]) + 0.5 * mse(policy.critic(obs[b]).squeeze(-1), ret[b])
+            opt.zero_grad(); loss.backward(); opt.step()
+        if epoch % 5 == 0 or epoch == args.epochs - 1:
+            with torch.no_grad():
+                print(f'epoch {epoch}: val actor mse {mse(policy.actor(obs[val]), act[val]):.4f}, '
+                      f'val critic mse {mse(policy.critic(obs[val]).squeeze(-1), ret[val]):.4f}', flush=True)
+    # Become the only/latest checkpoint so `--load-checkpoint True` / `--train False` pick it up
+    model_dir, meta_dir = PPO_CHECKPOINT_DIR + args.town, f'checkpoints/PPO_coop/{args.town}'
+    os.makedirs(model_dir, exist_ok=True); os.makedirs(meta_dir, exist_ok=True)
+    assert not os.listdir(model_dir), f'{model_dir} is not empty, move old models away first'
+    torch.save(policy.state_dict(), f'{model_dir}/ppo_policy_0_.pth')
+    torch.save(policy.state_dict(), f'data/bc_policy_{args.town}.pth')  # PPO overwrites ppo_policy_0 later, keep a copy
+    with open(f'{meta_dir}/checkpoint_ppo_0.pickle', 'wb') as f:
+        pickle.dump({'cumulative_score': 0, 'episode': 0, 'timestep': 0, 'action_std_init': args.action_std}, f)
+    print('saved BC policy to', model_dir)
+
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('mode', choices=['collect', 'train'])
+    p.add_argument('--town', default='Town07')
+    p.add_argument('--steps', type=int, default=40000)
+    p.add_argument('--noise', type=float, default=0.2, help='steer noise std while collecting')
+    p.add_argument('--no-scenarios', dest='scenarios', action='store_false', help='no pedestrians / slow cars while collecting')
+    p.add_argument('--epochs', type=int, default=30)
+    p.add_argument('--action-std', type=float, default=0.05, help='PPO exploration for the fine-tune, small to keep the BC behaviour')
+    args = p.parse_args()
+    random.seed(0); np.random.seed(0); torch.manual_seed(0)
+    collect(args) if args.mode == 'collect' else train(args)
