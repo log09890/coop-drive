@@ -57,3 +57,21 @@ s = summarize([dict(km=0.5, route_done=True, progress=1.0, collisions=1, near_mi
                dict(km=0.5, route_done=False, progress=0.5, collisions=0, near_miss_steps=0, red_runs=2, mean_speed=5, jerk=0.3, end='stuck')])
 assert s['collisions_per_km'] == 1 and s['near_miss_s_per_km'] == 1.0 and s['red_light_runs_per_km'] == 2 and s['route_done_%'] == 50
 print('summary ok')
+
+import torch
+from insight import closest_approach, input_sensitivity, group_sensitivity, SessionMetrics
+# bike 10 m ahead coming straight at us at 5 m/s -> meets in 2 s at 0 m; bike moving away -> closest now
+t, d = closest_approach([[10, 0], [10, 0]], [[-5, 0], [5, 0]])
+assert np.allclose(t, [2, 0]) and np.allclose(d, [0, 10])
+# crossing 1 m off our path still counts as a conflict at t = 2 s
+t, d = closest_approach([[10, 1]], [[-5, 0]]); assert np.isclose(t[0], 2) and np.isclose(d[0], 1)
+# sensitivity of a linear "actor": d out / d x = weights
+lin = torch.nn.Linear(4, 2, bias=False)
+with torch.no_grad(): lin.weight.copy_(torch.tensor([[1., 0, 0, -2], [0, 3, 0, 0]]))
+st, pe = input_sensitivity(lin, torch.zeros(4)); assert np.allclose(st, [1, 0, 0, 2]) and np.allclose(pe, [0, 3, 0, 0])
+g = group_sensitivity(np.ones(95 + 5 + 34), 95, 16)
+assert g['camera (VAE)'] == 95 and g['LiDAR sectors'] == 16 and g['lane corridor'] == 1 and g['motion (deltas)'] == 17
+m = SessionMetrics()
+for _ in range(20): m.step(36.0, 1.5, False)  # 10 m/s for 1 s, all of it a near miss
+assert np.isclose(m.km, 0.01) and np.isclose(m.near_miss_s, 1.0) and m.step(36.0, 9, True) == ['red_light'] and m.red_runs == 1
+print('insight ok')

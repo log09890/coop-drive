@@ -35,6 +35,7 @@ thành `COOP_SECTORS` khoảng cách vật cản gần nhất theo từng góc, 
 6 ô: camera, LiDAR hợp tác kiểu CODD, cảm biến, VAE · PPO, reward, traffic (bản đồ + nhãn tình huống) và Console (log + lệnh).
 Bấm `/` hoặc Enter để gõ lệnh, `/help` để xem: `/spawn <event>`, `/chaos on|off|<s>`, `/density <n>`, `/driver expert|ppo`,
 `/weather clear|cloudy|rain|sunset`, `/pause`, `/reset`, `/snapshot`, `/clear`, `/quit`.
+Ô Traffic: camera nhìn từ trên xuống, mũi tên = vị trí sau 2 s, vòng đỏ = sắp gặp ego trong < 3 s (TTC). Vòng sáng quanh radar và dòng "policy brakes because of" = đầu vào chi phối quyết định ga/phanh (gradient của actor). Console: chỉ số cả phiên + dải 60 s sự kiện. Va chạm → tự phát lại ~10 s cuối; `/replay`, `/gif`, `/focus <ô>`, ↑/↓ lịch sử lệnh, Tab tự hoàn thành.
 Action thứ hai: > 0 là ga, < 0 là phanh. Chưa có model khớp observation thì tài xế mẫu lái.
 
 ### Giao thông đô thị kiểu Việt Nam (`--vn`, nên dùng Town02)

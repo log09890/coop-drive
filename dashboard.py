@@ -6,7 +6,9 @@ Live dashboard for the coop PPO agent (needs COOP_SECTORS > 0 and a running CARL
 Press / or Enter to type a command, /help lists them.
 '''
 import argparse
+import collections
 import math
+import os
 import time
 import weakref
 import numpy as np
@@ -23,6 +25,7 @@ from autoencoder.decoder import Decoder
 from networks.on_policy.ppo.agent import PPOAgent
 from parameters import LATENT_DIM
 from bc import expert_action
+from insight import closest_approach, input_sensitivity, group_sensitivity, SessionMetrics
 
 W, H, HEAD, CONSOLE = 1280, 840, 28, 118  # canvas; the window is scaled to fit the screen
 BIG, CELL = (640, 340), (320, 352)
@@ -38,22 +41,35 @@ HELP = [
     ('/weather <name>', ' '.join(WEATHER)),
     ('/pause', 'freeze / resume the simulation'),
     ('/reset', 'new episode'),
+    ('/replay', 'play back the last ~10 s (also automatic after a collision)'),
+    ('/gif [file]', 'save the last ~10 s as an animated GIF in replays/'),
+    ('/focus <panel>|off', 'enlarge a panel: ' + ' '.join(['camera', 'lidar', 'sensors', 'policy', 'reward', 'traffic'])),
     ('/snapshot [file]', 'save the window as PNG'),
     ('/clear', 'clear the log'),
     ('/quit', 'exit'),
+    ('↑ ↓  Tab', 'command history, completion'),
 ]
+PANELS = {'camera': (0, HEAD, *BIG), 'lidar': (BIG[0], HEAD, *BIG), 'sensors': (0, HEAD + BIG[1] + 2, *CELL),
+          'policy': (CELL[0], HEAD + BIG[1] + 2, *CELL), 'reward': (2 * CELL[0], HEAD + BIG[1] + 2, *CELL),
+          'traffic': (3 * CELL[0], HEAD + BIG[1] + 2, *CELL)}
+COMPLETE = {'spawn': sorted(SCENARIOS) + sorted(EVENTS), 'weather': sorted(WEATHER), 'driver': ['expert', 'ppo'],
+            'focus': sorted(PANELS) + ['off'], 'chaos': ['on', 'off']}
+BEV = (300, 180)  # top-down camera: 40 m up, 70 deg fov -> 56 m wide
+BEV_PX_PER_M = BEV[0] / (2 * 40 * math.tan(math.radians(35)))
 
 
 class ChaseCamera:
-    '''Third person RGB camera; the callback only stores the frame (pygame stays on the main thread).'''
+    '''RGB camera on the ego (third person by default, or top-down for the BEV); the callback only stores the frame.'''
 
-    def __init__(self, vehicle):
+    def __init__(self, vehicle, size=BIG, transform=None, fov=None):
         bp = vehicle.get_world().get_blueprint_library().find('sensor.camera.rgb')
-        bp.set_attribute('image_size_x', str(BIG[0]))
-        bp.set_attribute('image_size_y', str(BIG[1]))
+        bp.set_attribute('image_size_x', str(size[0]))
+        bp.set_attribute('image_size_y', str(size[1]))
+        if fov:
+            bp.set_attribute('fov', str(fov))
         self.frame = None
-        self.sensor = vehicle.get_world().spawn_actor(
-            bp, carla.Transform(carla.Location(x=-6.0, z=3.0), carla.Rotation(pitch=-15.0)), attach_to=vehicle)
+        transform = transform or carla.Transform(carla.Location(x=-6.0, z=3.0), carla.Rotation(pitch=-15.0))
+        self.sensor = vehicle.get_world().spawn_actor(bp, transform, attach_to=vehicle)
         weak_self = weakref.ref(self)
         self.sensor.listen(lambda image: ChaseCamera._on_image(weak_self, image))
 
@@ -171,13 +187,61 @@ class Dashboard:
         self.typing, self.line, self.show_help = False, '', False
         self.paused = self.quit = self.want_reset = False
         self.ep_reward = 0.0
+        self.history, self.hist_i = [], 0
+        self.focus = None
+        self.metrics, self.timeline, self.sim_t = SessionMetrics(), [], 0.0  # timeline: (sim time s, kind, label)
+        self.frames = collections.deque(maxlen=120)  # ~10+ s of half-size window frames for the instant replay
+        self.replay, self.replay_i = None, 0
+        self.bev = self.collision = None
+        self.hits = []
 
     def new_episode(self, env):
         self.chase = ChaseCamera(env.vehicle)
-        env.sensor_list.append(self.chase.sensor)
+        self.bev = ChaseCamera(env.vehicle, BEV, carla.Transform(carla.Location(z=40.0), carla.Rotation(pitch=-90.0)), fov=70)
+        bp = env.world.get_blueprint_library().find('sensor.other.collision')
+        self.collision = env.world.spawn_actor(bp, carla.Transform(), attach_to=env.vehicle)
+        self.hits = []
+        self.collision.listen(lambda e: self.hits.append(e.other_actor.type_id))  # read on the main thread in mark()
+        env.sensor_list += [self.chase.sensor, self.bev.sensor, self.collision]
         self.episode += 1
         self.ep_reward = 0.0
+        self.metrics.episodes += 1
+        self.mark('episode', f'ep {self.episode}')
         self.log(f'episode {self.episode}')
+
+    def mark(self, kind, label=''):
+        self.timeline = [e for e in self.timeline if e[0] > self.sim_t - 60] + [(self.sim_t, kind, label)]
+
+    def after_step(self, env):
+        '''Session metrics, timeline events and collisions for one simulation step.'''
+        self.sim_t += 0.05
+        for kind in self.metrics.step(env.velocity, env.front_obstacle, env.red_moving):
+            self.mark(kind)
+        if self.hits:
+            what = self.hits[0].split('.')[-1]
+            self.hits = []
+            self.metrics.collisions += 1
+            self.mark('collision', what)
+            self.log(f'collision with {what}')
+            return True
+        return False
+
+    def start_replay(self):
+        if len(self.frames) < 5:
+            return self.log('nothing to replay yet')
+        self.replay, self.replay_i = list(self.frames), 0
+        self.log(f'replay {len(self.replay)} frames · Esc to stop')
+
+    def save_gif(self, path=None):
+        from PIL import Image
+        if len(self.frames) < 5:
+            return self.log('nothing to save yet')
+        os.makedirs('replays', exist_ok=True)
+        path = path or os.path.join('replays', time.strftime('replay_%H%M%S.gif'))
+        imgs = [Image.frombytes('RGB', f.get_size(), pygame.image.tostring(f, 'RGB')).resize((480, 315))
+                for f in list(self.frames)[::2]]
+        imgs[0].save(path, save_all=True, append_images=imgs[1:], duration=100, loop=0)
+        self.log(f'saved {path}')
 
     def log(self, text):
         self.events = ([time.strftime('%H:%M:%S  ') + text] + self.events)[:5]
@@ -213,6 +277,8 @@ class Dashboard:
                 ok = bool(EVENTS[name](env))
             else:
                 return self.log(f'unknown event {name}')
+            if ok:
+                self.mark('chaos', name)
             return self.log(f'{name}' if ok else f'{name}: no free spot, try again')
         if cmd == 'chaos':
             if not env.traffic:
@@ -239,6 +305,16 @@ class Dashboard:
         if cmd == 'reset':
             self.want_reset = True
             return
+        if cmd == 'replay':
+            return self.start_replay()
+        if cmd == 'gif':
+            return self.save_gif(args[0] if args else None)
+        if cmd == 'focus':
+            name = args[0].lower() if args else 'off'
+            if name != 'off' and name not in PANELS:
+                return self.log(f'panels: {" ".join(PANELS)}')
+            self.focus = None if name == 'off' else name
+            return self.log(f'focus {name}')
         if cmd == 'snapshot':
             path = args[0] if args else time.strftime('snapshot_%H%M%S.png')
             pygame.image.save(self.screen, path)
@@ -251,6 +327,21 @@ class Dashboard:
             return
         self.log(f'unknown: /{" ".join(parts)}  (/help)')
 
+    def complete(self, line):
+        '''Tab: complete the command, then its argument; several matches -> longest common prefix.'''
+        parts = line.lstrip('/').split(' ')
+        if len(parts) == 1:
+            options, word = [c.split()[0].lstrip('/') for c, _ in HELP if c.startswith('/')], parts[0]
+        else:
+            options, word = COMPLETE.get(parts[0], []), parts[-1]
+        hits = [o for o in options if o.startswith(word)]
+        if not hits:
+            return line
+        done = os.path.commonprefix(hits) + (' ' if len(hits) == 1 else '')
+        if len(hits) > 1:
+            self.log('  '.join(hits))
+        return '/' + ' '.join(parts[:-1] + [done])
+
     def handle_events(self, env):
         for e in pygame.event.get():
             if e.type == pygame.QUIT:
@@ -259,15 +350,22 @@ class Dashboard:
                 self.window = pygame.display.set_mode(e.size, pygame.RESIZABLE)
             elif e.type == pygame.KEYDOWN and not self.typing:
                 if e.key in (pygame.K_SLASH, pygame.K_RETURN, pygame.K_KP_DIVIDE):
-                    self.typing, self.line = True, '/'
+                    self.typing, self.line, self.hist_i = True, '/', len(self.history)
                 elif e.key == pygame.K_ESCAPE:
-                    self.show_help = False
+                    self.show_help, self.replay = False, None
             elif e.type == pygame.KEYDOWN:
                 if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                     self.typing = False
+                    if self.line.strip('/ '):
+                        self.history = [h for h in self.history if h != self.line] + [self.line]
                     self.run(env, self.line)
                 elif e.key == pygame.K_ESCAPE:
                     self.typing, self.line = False, ''
+                elif e.key in (pygame.K_UP, pygame.K_DOWN) and self.history:
+                    self.hist_i = max(0, min(len(self.history), self.hist_i + (-1 if e.key == pygame.K_UP else 1)))
+                    self.line = self.history[self.hist_i] if self.hist_i < len(self.history) else '/'
+                elif e.key == pygame.K_TAB:
+                    self.line = self.complete(self.line)
                 elif e.key == pygame.K_BACKSPACE:
                     self.line = self.line[:-1]
                 elif e.unicode and e.unicode.isprintable():
@@ -275,6 +373,7 @@ class Dashboard:
         if env.traffic and env.traffic.log:  # surprise events fired by the chaos timer
             for name in env.traffic.log:
                 self.log(f'chaos: {name}')
+                self.mark('chaos', name)
             env.traffic.log.clear()
 
     # ------------------------------------------------------------------ drawing
@@ -319,6 +418,17 @@ class Dashboard:
             pygame.draw.polygon(s, col, [(cx, cy)] + [(cx + rr * math.sin(a), cy - rr * math.cos(a)) for a in np.linspace(a0, a1, 4)])
         pygame.draw.circle(s, DIM, (cx, cy), r, 1)
         pygame.draw.polygon(s, FG, [(cx, cy - 9), (cx - 5, cy + 6), (cx + 5, cy + 6)])
+        # outer ring: how much each direction drives the pedal right now (now + motion features of that sector)
+        steer_s, pedal_s = input_sensitivity(self.agent.old_policy.actor, obs)
+        c0 = LATENT_DIM + 5
+        sect = pedal_s[c0:c0 + n] + pedal_s[c0 + n + 1:c0 + 2 * n + 1]
+        top = sect.max() or 1.0
+        for k in range(n):
+            a0, a1 = -math.pi + k * 2 * math.pi / n, -math.pi + (k + 1) * 2 * math.pi / n
+            w = sect[k] / top
+            if w > 0.5:  # only the directions that clearly dominate the decision
+                pts = [(cx + (r + 6) * math.sin(a), cy - (r + 6) * math.cos(a)) for a in np.linspace(a0, a1, 5)]
+                pygame.draw.lines(s, (int(70 + 185 * w), int(200 * w), 255), False, pts, int(2 + 6 * w))
 
         # 4 perception + policy
         x, y = self.panel((CELL[0], row, *CELL), 'VAE · PPO')
@@ -334,9 +444,16 @@ class Dashboard:
             pygame.draw.rect(s, (c, 60, 255 - c), (x + k * 3, y + 160, 3, 16))
         self.bar(x, y + 196, 150, mean[0], 'π steer', ORANGE)
         self.bar(x, y + 216, 150, mean[1], 'π pedal', GREEN)
-        self.bar(x, y + 244, 150, float(action[0]), 'a steer', ORANGE)
-        self.bar(x, y + 264, 150, float(action[1]), 'a pedal', GREEN)
-        self.text(f'V(s) {value:+.2f}', (x, y + 292), FG)
+        groups = group_sensitivity(pedal_s, LATENT_DIM, COOP_SECTORS)
+        total = sum(groups.values()) or 1.0
+        why = sorted(groups.items(), key=lambda kv: -kv[1])[:3]
+        verb = 'brakes' if mean[1] < -0.05 else 'accelerates' if mean[1] > 0.05 else 'holds'
+        self.text(f'policy {verb} because of:' if self.policy_ok else 'no policy loaded (expert drives)', (x, y + 236), CYAN, self.small)
+        for k, (name, val) in enumerate(why):
+            pygame.draw.rect(s, (50, 50, 60), (x, y + 256 + k * 17, 120, 10))
+            pygame.draw.rect(s, GREEN, (x, y + 256 + k * 17, int(120 * val / total), 10))
+            self.text(f'{name} {100 * val / total:.0f}%', (x + 128, y + 253 + k * 17), FG, self.small)
+        self.text(f'V(s) {value:+.2f}', (x, y + 310), FG, self.small)
 
         # 5 reward logic
         x, y = self.panel((2 * CELL[0], row, *CELL), 'Reward')
@@ -366,27 +483,49 @@ class Dashboard:
         x, y = self.panel((3 * CELL[0], row, *CELL), 'Traffic')
         t = env.vehicle.get_transform()
         yaw = math.radians(t.rotation.yaw)
-        mx, my, scale = x + 150, y + 95, 1.6
+        mx, my, scale = x + BEV[0] // 2, y + BEV[1] // 2, BEV_PX_PER_M
+        if self.bev and self.bev.frame is not None:
+            s.blit(pygame.surfarray.make_surface(self.bev.frame), (x, y))
 
         def to_map(l):
             dx, dy = l.x - t.location.x, l.y - t.location.y
             f, rgt = dx * math.cos(yaw) + dy * math.sin(yaw), -dx * math.sin(yaw) + dy * math.cos(yaw)
             return mx + rgt * scale, my - f * scale
 
-        s.set_clip(pygame.Rect(x - 4, y, 312, 180))
-        route = [to_map(w.transform.location) for w in env.route_waypoints[::4]]
+        s.set_clip(pygame.Rect(x, y, *BEV))
+        route = [to_map(w.transform.location) for w in env.route_waypoints[env.current_waypoint_index::2][:40]]
         if len(route) > 1:
-            pygame.draw.lines(s, (70, 70, 90), False, route, 3)
-        riders = {r.v.id for r in env.riders if r.v}
-        for a in env.world.get_actors().filter('vehicle.*'):
-            if a.id != env.vehicle.id:
-                bike = a.type_id in MOTORBIKES + BICYCLES
-                pygame.draw.circle(s, RED if a.id in riders else ORANGE if bike else CYAN, to_map(a.get_location()), 3 if bike else 4)
-        for a in env.world.get_actors().filter('walker.pedestrian.*'):
-            pygame.draw.circle(s, YELLOW, to_map(a.get_location()), 2)
-        pygame.draw.polygon(s, FG, [(mx, my - 7), (mx - 4, my + 5), (mx + 4, my + 5)])
+            pygame.draw.lines(s, (90, 90, 120), False, route, 2)
+        # every road user within 30 m: where it will be in 2 s (arrow) and whether it meets the ego within 3 s
+        ev = env.vehicle.get_velocity()
+        c, sn = math.cos(yaw), math.sin(yaw)
+        to_ego = lambda dx, dy: (dx * c + dy * sn, -dx * sn + dy * c)  # world xy -> (forward, right)
+        worst = None
+        for a in list(env.world.get_actors().filter('vehicle.*')) + list(env.world.get_actors().filter('walker.pedestrian.*')):
+            if a.id == env.vehicle.id:
+                continue
+            l, v = a.get_location(), a.get_velocity()
+            p = to_ego(l.x - t.location.x, l.y - t.location.y)
+            if math.hypot(*p) > 30:
+                continue
+            va, vr = to_ego(v.x, v.y), to_ego(v.x - ev.x, v.y - ev.y)
+            ttc, dist = closest_approach([p], [vr])
+            danger = dist[0] < 2.5 and 0 < ttc[0] < 3
+            u = (mx + p[1] * scale, my - p[0] * scale)
+            tip = (mx + (p[1] + 2 * va[1]) * scale, my - (p[0] + 2 * va[0]) * scale)
+            col = RED if danger else YELLOW if a.type_id.startswith('walker') else ORANGE if a.type_id in MOTORBIKES + BICYCLES else CYAN
+            if math.hypot(va[0], va[1]) > 0.5:
+                pygame.draw.line(s, col, u, tip, 2)
+            pygame.draw.circle(s, col, (int(u[0]), int(u[1])), 6 if danger else 3, 2 if danger else 0)
+            if danger:
+                meet = (mx + (p[1] + vr[1] * ttc[0]) * scale, my - (p[0] + vr[0] * ttc[0]) * scale)
+                pygame.draw.circle(s, RED, (int(meet[0]), int(meet[1])), 4)
+                if worst is None or ttc[0] < worst[0]:
+                    worst = (ttc[0], a.type_id.split('.')[-1])
+        pygame.draw.polygon(s, FG, [(mx, my - 8), (mx - 5, my + 6), (mx + 5, my + 6)])
         s.set_clip(None)
-        for k, (label, col) in enumerate(detect_situations(env)[:5]):
+        labels = ([(f'Conflict in {worst[0]:.1f} s: {worst[1]}', RED)] if worst else []) + detect_situations(env)
+        for k, (label, col) in enumerate(labels[:5]):
             self.text('● ' + label, (x, y + 186 + k * 17), col, self.small)
 
         # console: log + command line, help overlay
@@ -394,10 +533,35 @@ class Dashboard:
         pygame.draw.rect(s, PANEL, (0, cy0, W, CONSOLE), border_radius=6)
         self.text('Console', (8, cy0 + 4), CYAN, self.big)
         for k, e in enumerate(reversed(self.events[:5])):
-            self.text(e, (100, cy0 + 6 + k * 16), FG if k == min(4, len(self.events) - 1) else DIM, self.mono)
+            self.text(e[:58], (100, cy0 + 6 + k * 16), FG if k == min(4, len(self.events) - 1) else DIM, self.mono)
+        m = self.metrics.summary()
+        self.text(f"session {m['km'] * 1000:.0f} m   collisions/km {m['collisions_per_km']:.1f}   near-miss s/km "
+                  f"{m['near_miss_s_per_km']:.1f}   red/km {m['red_runs_per_km']:.1f}   v {m['mean_speed']:.1f} km/h",
+                  (650, cy0 + 4), FG, self.small)
+        tx0, tx1, ty = 650, W - 16, cy0 + 52  # last 60 s, now on the right
+        pygame.draw.line(s, DIM, (tx0, ty), (tx1, ty), 1)
+        for sec in range(0, 61, 10):
+            px = tx1 - (tx1 - tx0) * sec / 60
+            pygame.draw.line(s, DIM, (px, ty - 3), (px, ty + 3), 1)
+            self.text(f'-{sec}s' if sec else 'now', (px - 10, ty + 6), DIM, self.small)
+        styles = {'chaos': (CYAN, 9), 'near_miss': (ORANGE, 5), 'red_light': (YELLOW, 7), 'collision': (RED, 12), 'episode': (FG, 14)}
+        for k, (ts, kind, label) in enumerate(self.timeline):
+            px = tx1 - (tx1 - tx0) * (self.sim_t - ts) / 60
+            col, hgt = styles.get(kind, (DIM, 5))
+            pygame.draw.line(s, col, (px, ty - hgt), (px, ty), 3 if kind == 'collision' else 1)
+            if label and kind != 'near_miss':
+                self.text(label, (px - 4, ty - hgt - 14 - 12 * (k % 2)), col, self.small)
         pygame.draw.rect(s, (8, 8, 12), (8, H - 28, W - 16, 22), border_radius=4)
         prompt = '> ' + self.line + ('_' if time.time() % 1 < .5 else '') if self.typing else '> press / or Enter · /help'
         self.text(prompt, (14, H - 26), FG if self.typing else DIM, self.mono)
+        if self.focus:  # enlarge one panel over the dashboard, aspect kept
+            rx, ry, rw, rh = PANELS[self.focus]
+            area = (W, H - CONSOLE - HEAD - 4)
+            k = min(area[0] / rw, area[1] / rh)
+            big = pygame.transform.smoothscale(s.subsurface((rx, ry, rw, rh)).copy(), (int(rw * k), int(rh * k)))
+            pygame.draw.rect(s, BG, (0, HEAD, W, area[1] + 2))
+            s.blit(big, ((W - big.get_width()) // 2, HEAD))
+            self.text(f' {self.focus} · /focus off ', (12, HEAD + 4), CYAN, self.big, BG)
         if self.show_help:
             bw, bh = 960, 28 + 22 * len(HELP)
             bx, by = (W - bw) // 2, (H - bh) // 2
@@ -406,8 +570,23 @@ class Dashboard:
             for k, (c, d) in enumerate(HELP):
                 self.text(c, (bx + 16, by + 14 + 22 * k), CYAN, self.mono)
                 self.text(d, (bx + 240, by + 14 + 22 * k), FG, self.mono)
+        self.frames.append(pygame.transform.smoothscale(s, (W // 2, H // 2)))
         pygame.transform.smoothscale(s, self.window.get_size(), self.window)
         pygame.display.flip()
+
+    def draw_replay(self):
+        '''Half speed playback of the stored frames; returns False when it is over.'''
+        f = self.replay[min(self.replay_i // 2, len(self.replay) - 1)]
+        frame = pygame.transform.smoothscale(f, (W, H))
+        pygame.draw.rect(frame, RED, (0, 0, W, 30))
+        frame.blit(self.big.render(f'  REPLAY {self.replay_i // 2 + 1}/{len(self.replay)}  ·  half speed  ·  Esc to stop  ·  /gif to save',
+                                   True, FG), (10, 6))
+        pygame.transform.smoothscale(frame, self.window.get_size(), self.window)
+        pygame.display.flip()
+        self.replay_i += 1
+        if self.replay_i // 2 >= len(self.replay):
+            self.replay = None
+        return self.replay is not None
 
 
 def main():
@@ -445,6 +624,10 @@ def main():
             o = encode.process(observation)
             while not dash.quit:
                 dash.handle_events(env)
+                if dash.replay:
+                    dash.draw_replay()
+                    clock.tick(20)
+                    continue
                 if dash.want_reset:
                     dash.want_reset = False
                     client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list], True)
@@ -460,9 +643,13 @@ def main():
                     break
                 observation, reward, done, info = result
                 dash.ep_reward += reward
+                crashed = dash.after_step(env)
                 if done:
                     dash.log(f'episode {dash.episode} end · R {dash.ep_reward:.0f} · ' + ('route done' if reward > -10 else 'penalty −10'))
+                    dash.mark('episode', 'end')
                     env.riders.clear()
+                    if crashed or reward <= -10:
+                        dash.start_replay()  # instant replay of the last seconds before the episode ended
                     break
                 o = encode.process(observation)
                 dash.draw(env, o, action, reward)
