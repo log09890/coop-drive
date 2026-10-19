@@ -30,7 +30,9 @@ COOP_SECTORS = 16
 COOP_VEHICLES = 5
 COOP_RANGE = 50.0
 COOP_CORRIDOR = 20.0  # lane-ahead obstacle check length (m), one extra obs value
-COOP_OBS = 2 * (COOP_SECTORS + 1) if COOP_SECTORS else 0  # (sectors + corridor) now, and their change since the last step
+# (sectors + corridor) now and their change since the last step, + the V2X view from the infrastructure (zeros if off)
+INFRA_DIM = 22  # = simulation.infrastructure.INFRA_DIM
+COOP_OBS = 2 * (COOP_SECTORS + 1) + INFRA_DIM if COOP_SECTORS else 0
 LIDAR_CHANNELS = 32
 LIDAR_LOWER_FOV = -25.0
 LIDAR_POINTS_PER_SECOND = 100000

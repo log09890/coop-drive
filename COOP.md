@@ -47,6 +47,14 @@ Shortcut "Coop-Drive VN Traffic". `simulation/vn_traffic.py`:
 - Xe do script lái tự giữ khoảng cách theo kích thước xe; xe nào lật/bay được đặt lại trên đường; hybrid physics cho xe ở xa (> 70 m).
 - Train/thu dữ liệu trong môi trường này: `bc.py collect --town Town02 --vn`, `continuous_driver.py --town Town02 --vn-traffic`. Chạy khoảng 6–7 bước/giây với dashboard.
 
+### Hạ tầng tự hành (`--infra`, giai đoạn 1)
+
+Shortcut "Coop-Drive Infra" hoặc `dashboard.py --town Town02 --vn --infra`. `simulation/infrastructure.py`:
+- **RSU** ở mỗi ngã tư (8 ở Town02): LiDAR trên cột 6 m (góc dưới −40°), tự tách nền tĩnh và gom cụm thành danh sách vật thể (vị trí, vận tốc, loại); sai số đo được ~0.5 m.
+- **Kênh V2X**: trễ 100 ms ± 30, mất 10% gói, tầm 300 m, sai số GPS 1.5 m. Tin nhắn: **CAM** (xe hợp tác báo vị trí/vận tốc của mình), **CPM** (RSU báo vật thể nó thấy, 10 Hz), **SPaT** (đèn báo màu và số giây còn lại, tính theo vòng quay cả nhóm đèn + pha đỏ toàn bộ).
+- **Observation** thêm 22 số: 4 vật thể V2X gần nhất (vị trí, vận tốc tương đối, ngoại suy theo độ trễ), đèn phía trước trên tuyến (khoảng cách, màu, giây còn lại), độ "cũ" của thông tin. Không bật `--infra` thì 22 số này bằng 0 (cùng kiến trúc model). Model cũ (134 đầu vào) cần thu dữ liệu + BC lại (`bc.py collect/train --infra`).
+- Dashboard: LiDAR của RSU trong ô LiDAR (ô vuông vàng), vật thể biết qua V2X trong ô Traffic (ô vuông xanh), khối V2X trong ô Reward; `/v2x latency|loss|range|gps <giá trị>`, `/v2x on|off`.
+
 ### Reward, observation và đánh giá (chế độ coop)
 
 - Observation coop = (16 hướng + hành lang) **và độ thay đổi của chúng so với bước trước**, để agent thấy xe nào đang lao tới: 100 + 34 = 134 chiều.

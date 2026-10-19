@@ -39,6 +39,7 @@ HELP = [
     ('/density <n>', 'number of motorbikes (kept around the ego)'),
     ('/driver expert|ppo', 'who drives'),
     ('/weather <name>', ' '.join(WEATHER)),
+    ('/v2x <key> <value>', 'latency <ms> · loss <%> · range <m> · gps <m> · on · off  (needs --infra)'),
     ('/pause', 'freeze / resume the simulation'),
     ('/reset', 'new episode'),
     ('/replay', 'play back the last ~10 s (also automatic after a collision)'),
@@ -53,7 +54,7 @@ PANELS = {'camera': (0, HEAD, *BIG), 'lidar': (BIG[0], HEAD, *BIG), 'sensors': (
           'policy': (CELL[0], HEAD + BIG[1] + 2, *CELL), 'reward': (2 * CELL[0], HEAD + BIG[1] + 2, *CELL),
           'traffic': (3 * CELL[0], HEAD + BIG[1] + 2, *CELL)}
 COMPLETE = {'spawn': sorted(SCENARIOS) + sorted(EVENTS), 'weather': sorted(WEATHER), 'driver': ['expert', 'ppo'],
-            'focus': sorted(PANELS) + ['off'], 'chaos': ['on', 'off']}
+            'focus': sorted(PANELS) + ['off'], 'chaos': ['on', 'off'], 'v2x': ['latency', 'loss', 'range', 'gps', 'on', 'off']}
 BEV = (300, 180)  # top-down camera: 40 m up, 70 deg fov -> 56 m wide
 BEV_PX_PER_M = BEV[0] / (2 * 40 * math.tan(math.radians(35)))
 
@@ -113,7 +114,7 @@ def lidar_render(clouds, poses, ego_pose, size, cam_back=28.0, cam_up=38.0, tilt
     img[ui, vi] = color
     img[ui + 1, vi] = color  # 2 px dots read better at this scale
     su, sv, sok = project(sensors)
-    return img, [(int(a), int(b), i == 0) for i, (a, b, o) in enumerate(zip(su, sv, sok)) if o]
+    return img, [(int(a), int(b), i) for i, (a, b, o) in enumerate(zip(su, sv, sok)) if o]  # i: index of the sensor
 
 
 def detect_situations(env):
@@ -305,6 +306,23 @@ class Dashboard:
         if cmd == 'reset':
             self.want_reset = True
             return
+        if cmd == 'v2x':
+            if not env.infra:
+                return self.log('v2x needs --infra')
+            ch, key = env.infra.channel, args[0].lower() if args else ''
+            val = float(args[1]) if len(args) > 1 and args[1].replace('.', '', 1).isdigit() else None
+            if key in ('on', 'off'):
+                env.infra.enabled = key == 'on'
+            elif key == 'latency' and val is not None:
+                ch.latency = val / 1000
+            elif key == 'loss' and val is not None:
+                ch.loss = min(val, 100) / 100
+            elif key == 'range' and val is not None:
+                ch.range = val
+            elif key == 'gps' and val is not None:
+                env.infra.gps_sigma = val
+            return self.log(f"v2x {'on' if env.infra.enabled else 'off'} · {ch.latency * 1000:.0f} ms · loss {ch.loss * 100:.0f}% · "
+                            f"range {ch.range:.0f} m · gps {env.infra.gps_sigma:.1f} m")
         if cmd == 'replay':
             return self.start_replay()
         if cmd == 'gif':
@@ -397,11 +415,18 @@ class Dashboard:
 
         # 2 cooperative LiDAR (CODD-style)
         scans = [l.latest for l in env.lidar_objs if l.latest is not None]
+        n_cars = len(scans)
+        if env.infra:
+            scans += [r['lidar'].latest for r in env.infra.rsus if r['lidar'].latest is not None]
         img, marks = lidar_render([sc[0] for sc in scans], [sc[1] for sc in scans], env.lidar_objs[0].latest[1], BIG)
         s.blit(pygame.surfarray.make_surface(img), (BIG[0], HEAD))
-        for u, v, ego in marks:
-            pygame.draw.circle(s, (255, 255, 255) if ego else CYAN, (BIG[0] + u, HEAD + v), 6 if ego else 4, 2)
-        self.text(f' Coop LiDAR · {len(scans)} sensors ', (BIG[0] + 8, HEAD + 4), CYAN, self.big, BG)
+        for u, v, i in marks:
+            if i >= n_cars:
+                pygame.draw.rect(s, YELLOW, (BIG[0] + u - 5, HEAD + v - 5, 10, 10), 2)
+            else:
+                pygame.draw.circle(s, (255, 255, 255) if i == 0 else CYAN, (BIG[0] + u, HEAD + v), 6 if i == 0 else 4, 2)
+        rsu = f' + {len(scans) - n_cars} RSU' if env.infra else ''
+        self.text(f' Coop LiDAR · {n_cars} cars{rsu} ', (BIG[0] + 8, HEAD + 4), CYAN, self.big, BG)
 
         row = HEAD + BIG[1] + 2
         sectors = obs[100:100 + COOP_SECTORS].cpu().numpy()
@@ -474,6 +499,17 @@ class Dashboard:
             self.text(line, (x, y + k * 20), col, self.small)
         for k, (name, on) in enumerate(flags):
             self.text(('● ' if on else '○ ') + name, (x + (k % 2) * 150, y + 128 + (k // 2) * 18), RED if on else DIM, self.small)
+        if env.infra:
+            v2x = env.infra.channel.summary(env.infra.t)
+            ego_l = env.vehicle.get_location()
+            near = sum(math.hypot(r['xy'][0] - ego_l.x, r['xy'][1] - ego_l.y) < 50 for r in env.infra.rsus)
+            la = env.infra.light_ahead
+            infra_lines = [(f"V2X {'on' if env.infra.enabled else 'OFF'}  {v2x['msg_per_s']:.0f} msg/s  {v2x['latency_ms']:.0f} ms  "
+                            f"lost {100 * v2x['loss']:.0f}%", CYAN),
+                           (f'RSU near {near}/{len(env.infra.rsus)}   objects known {len(env.infra.known)}', CYAN),
+                           (f'light ahead {la[1].upper()} {la[2]:.0f} s · {la[0]:.0f} m' if la else 'light ahead: none', RED if la and la[1] == 'Red' else YELLOW if la else DIM)]
+            for k, (line, col) in enumerate(infra_lines):
+                self.text(line, (x, y + 172 + k * 18), col, self.small)
         self.reward_hist = (self.reward_hist + [reward])[-150:]
         pts = [(x + k * 2, y + 290 - 40 * max(rw, -1)) for k, rw in enumerate(self.reward_hist)]
         if len(pts) > 1:
@@ -522,6 +558,14 @@ class Dashboard:
                 pygame.draw.circle(s, RED, (int(meet[0]), int(meet[1])), 4)
                 if worst is None or ttc[0] < worst[0]:
                     worst = (ttc[0], a.type_id.split('.')[-1])
+        if env.infra:
+            for r in env.infra.rsus:
+                p = to_ego(r['xy'][0] - t.location.x, r['xy'][1] - t.location.y)
+                pygame.draw.rect(s, YELLOW, (mx + p[1] * scale - 5, my - p[0] * scale - 5, 10, 10), 2)
+            for o in env.infra.known.values():
+                age = env.infra.t - o['t']
+                p = to_ego(o['x'] + o['vx'] * age - t.location.x, o['y'] + o['vy'] * age - t.location.y)
+                pygame.draw.rect(s, (120, 255, 255), (mx + p[1] * scale - 4, my - p[0] * scale - 4, 8, 8), 1)
         pygame.draw.polygon(s, FG, [(mx, my - 8), (mx - 5, my + 6), (mx + 5, my + 6)])
         s.set_clip(None)
         labels = ([(f'Conflict in {worst[0]:.1f} s: {worst[1]}', RED)] if worst else []) + detect_situations(env)
@@ -596,11 +640,12 @@ def main():
     p.add_argument('--snapshot', default=None, help='save a PNG of the window every 200 steps')
     p.add_argument('--expert', action='store_true', help='drive with the waypoint expert from bc.py')
     p.add_argument('--vn', action='store_true', help='chaotic Vietnamese-style urban traffic (use with --town Town02)')
+    p.add_argument('--infra', action='store_true', help='roadside units + V2X (CAM / CPM / SPaT) feeding the ego')
     args = p.parse_args()
     assert COOP_SECTORS, 'dashboard needs COOP_SECTORS > 0 (simulation/settings.py)'
 
     client, world = ClientConnection(args.town).setup()
-    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn)
+    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, infra=args.infra)
     env.display_on = False  # the dashboard owns the pygame window
     encode = EncodeState(LATENT_DIM)
     agent = PPOAgent(args.town, 0.05)
@@ -659,6 +704,8 @@ def main():
         client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list + env.walker_list], True)
         if env.traffic:
             env.traffic.destroy()
+        if env.infra:
+            env.infra.destroy(client)
         settings = world.get_settings()
         settings.synchronous_mode, settings.fixed_delta_seconds = False, None  # leave the server usable for others
         world.apply_settings(settings)

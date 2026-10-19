@@ -75,3 +75,29 @@ m = SessionMetrics()
 for _ in range(20): m.step(36.0, 1.5, False)  # 10 m/s for 1 s, all of it a near miss
 assert np.isclose(m.km, 0.01) and np.isclose(m.near_miss_s, 1.0) and m.step(36.0, 9, True) == ['red_light'] and m.red_runs == 1
 print('insight ok')
+
+from simulation.infrastructure import V2XChannel, ObjectExtractor, encode_infra_obs, light_phase_left, INFRA_DIM, INFRA_K
+ch = V2XChannel(latency=0.1, jitter=0.0, loss=0.0, range_m=100)
+ch.send(0.0, (0, 0), {'t': 0.0, 'n': 1}); ch.send(0.0, (500, 0), {'t': 0.0, 'n': 2})
+assert ch.receive(0.05, (0, 0)) == [] and [m['n'] for m in ch.receive(0.1, (0, 0))] == [1]  # on time, far one dropped
+lossy = V2XChannel(loss=0.3, seed=1)
+for i in range(2000): lossy.send(0.0, (0, 0), {'t': 0.0})
+assert abs(len(lossy.receive(1.0, (0, 0))) / 2000 - 0.7) < 0.05
+# RSU: a wall stays put -> learned as background; a bike moving 5 m/s along x -> one object with vx ~ 5
+ex = ObjectExtractor(background_rate=0.05)
+wall = np.array([[20, y, 1.0] for y in np.arange(-5, 5, 0.2)] + [[20.3, y, 1.5] for y in np.arange(-5, 5, 0.2)])
+bike = lambda x: np.array([[x + dx, dy, z] for dx in (0, 0.7, 1.4, 2.0) for dy in (-0.2, 0.2) for z in (0.6, 1.2)])
+for k in range(60):
+    objs = ex(np.r_[wall, bike(k * 0.25)], 0.0, k * 0.05)  # 0.25 m per 0.05 s = 5 m/s
+assert len(objs) == 1 and objs[0]['kind'] == 'two-wheeler' and abs(objs[0]['vx'] - 5) < 1.0, objs
+o = encode_infra_obs((0, 0), 0.0, (0, 0), [{'x': 20, 'y': 0, 'vx': 0, 'vy': 0, 't': 0.0}, {'x': 5, 'y': 3, 'vx': -2, 'vy': 0, 't': 0.0}],
+                     0.0, light=(25.0, 'Red', 6.0))
+assert o.shape == (INFRA_DIM,) and np.allclose(o[:4], [5 / 30, 3 / 30, -0.2, 0]) and np.isclose(o[4], 20 / 30)  # nearest first
+assert np.allclose(o[INFRA_K * 4:INFRA_K * 4 + 5], [0.5, 1, 0, 0, 0.2])
+assert light_phase_left('Red', 3.0, 4.0, 1.5, 15.0) == 12.0
+print('infrastructure ok')
+from simulation.infrastructure import group_red_left
+# 4-light group, 4 s green + 1.5 s yellow each; light 1 is green with 3 s (+1.5 yellow) left: light 3 waits for 1 and 2
+assert group_red_left(3, 1, 4.5, [(4, 1.5)] * 4) == 4.5 + 5.5 and group_red_left(2, 1, 4.5, [(4, 1.5)] * 4) == 4.5
+assert group_red_left(3, 1, 4.5, [(4, 1.5)] * 4, clearance=2) == 4.5 + 2 + 5.5 + 2  # + an all-red gap per turn
+print('spat ok')

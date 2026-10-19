@@ -11,7 +11,7 @@ from simulation.settings import *
 
 class CarlaEnvironment():
 
-    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True, traffic=False, share=True) -> None:
+    def __init__(self, client, world, town, checkpoint_frequency=100, continuous_action=True, traffic=False, share=True, infra=False) -> None:
         self.share = share  # False: the coop features use the ego LiDAR only (ablation)
         self.prev_coop, self.last_sectors, self.prev_pedal = {}, np.ones(max(COOP_SECTORS, 1)), 0.0
 
@@ -51,6 +51,11 @@ class CarlaEnvironment():
         # traffic=True: chaotic Vietnamese-style background traffic (motorbikes, jaywalkers), kept across episodes
         self.traffic = None
         self.riders = []
+        # infra=True: roadside units at the junctions + V2X (CAM / CPM / SPaT) feed the ego (simulation/infrastructure.py)
+        self.infra = None
+        if infra and COOP_SECTORS:
+            from simulation.infrastructure import Infrastructure
+            self.infra = Infrastructure(world)
         self.vehicle_locs = []
         self.vehicle_xy, self.vehicle_ids, self.vehicle_ext = np.zeros((0, 2)), np.zeros(0), np.zeros((0, 2))
         if traffic:
@@ -197,6 +202,8 @@ class CarlaEnvironment():
                 self.wait_for(lambda: self.lidar_objs[0].latest is not None)
 
             self.prev_coop = {}  # motion features start at zero
+            if self.infra:
+                self.infra.reset()
             self.navigation_obs = np.concatenate([np.array([self.throttle, self.velocity, self.previous_steer, self.distance_from_center, self.angle]), self.coop_obs()])
 
                         
@@ -267,6 +274,8 @@ class CarlaEnvironment():
                 self.vehicle_ids = np.array([i for i, _ in self.vehicle_locs])
                 self.vehicle_ext = np.array([(a.bounding_box.extent.x, a.bounding_box.extent.y) for a in vs]).reshape(-1, 2)
                 self.riders = [r for r in self.riders if r.step()]  # scripted reckless motorbikes
+                if self.infra:
+                    self.infra.update(self)
                 if self.traffic:
                     self.traffic.update(self)
             
@@ -594,11 +603,15 @@ class CarlaEnvironment():
     def coop_obs(self):
         if not COOP_SECTORS:
             return np.zeros(0)
-        return self._coop_vec(self.share, primary=True)
+        return np.concatenate([self._coop_vec(self.share, primary=True), self.infra_obs()])
 
     # The same features for the other sharing mode (no side effects on the env), recorded for the ablation
     def coop_obs_other(self):
-        return self._coop_vec(not self.share, primary=False)
+        return np.concatenate([self._coop_vec(not self.share, primary=False), self.infra_obs()])
+
+    # What the ego knows through V2X (objects from RSUs / coop cars, the light ahead); zeros without infrastructure
+    def infra_obs(self):
+        return self.infra.obs(self) if self.infra else np.zeros(INFRA_DIM, np.float32)
 
     def _coop_vec(self, share, primary):
         sectors, front = self.coop_features(share)

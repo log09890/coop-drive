@@ -40,7 +40,11 @@ def group_sensitivity(s, latent, n_sectors):
     c = latent + 5
     g['LiDAR sectors'] = s[c:c + n_sectors].sum()
     g['lane corridor'] = s[c + n_sectors]
-    g['motion (deltas)'] = s[c + n_sectors + 1:].sum()
+    g['motion (deltas)'] = s[c + n_sectors + 1:c + 2 * (n_sectors + 1)].sum()
+    rest = s[c + 2 * (n_sectors + 1):]  # infrastructure part, if the observation has one
+    if len(rest):
+        g['V2X objects'] = rest[:-6].sum()
+        g['traffic light (SPaT)'] = rest[-6:-1].sum()
     return g
 
 

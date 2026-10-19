@@ -42,6 +42,7 @@ def main():
     p.add_argument('--town', default='Town02')
     p.add_argument('--vn', action='store_true')
     p.add_argument('--no-share', action='store_true', help='coop features from the ego LiDAR only')
+    p.add_argument('--infra', action='store_true', help='roadside units + V2X feeding the ego')
     p.add_argument('--model', default=None, help='policy .pth (default: latest in the ppo_coop folder)')
     p.add_argument('--expert', action='store_true')
     p.add_argument('--episodes', type=int, default=6)
@@ -53,7 +54,7 @@ def main():
     client, world = ClientConnection(args.town).setup()
     client.get_trafficmanager(8000).set_random_device_seed(args.seed)
     random.seed(args.seed); np.random.seed(args.seed)
-    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, share=not args.no_share)
+    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, share=not args.no_share, infra=args.infra)
     encode = EncodeState(LATENT_DIM)
     agent = PPOAgent(args.town, 0.05)
     if not args.expert:
@@ -111,6 +112,8 @@ def main():
         client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list + env.walker_list], True)
         if env.traffic:
             env.traffic.destroy()
+        if env.infra:
+            env.infra.destroy(client)
         s = world.get_settings(); s.synchronous_mode, s.fixed_delta_seconds = False, None; world.apply_settings(s)
     os.makedirs('results', exist_ok=True)
     out = {'name': args.name, 'args': vars(args), 'summary': summarize(eps), 'episodes': eps}

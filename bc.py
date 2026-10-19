@@ -49,7 +49,7 @@ def collect(args):
     from simulation.environment import CarlaEnvironment
     from simulation.scenarios import spawn_scenario
     client, world = ClientConnection(args.town).setup()
-    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn)
+    env = CarlaEnvironment(client, world, args.town, checkpoint_frequency=None, traffic=args.vn, infra=args.infra)
     encode = EncodeState(LATENT_DIM)
     obs_l, alt_l, act_l, rew_l, done_l = [], [], [], [], []
     while len(obs_l) < args.steps:
@@ -142,6 +142,7 @@ if __name__ == '__main__':
     p.add_argument('--steps', type=int, default=40000)
     p.add_argument('--noise', type=float, default=0.2, help='steer noise std while collecting')
     p.add_argument('--vn', action='store_true', help='collect in chaotic Vietnamese-style traffic (use with --town Town02)')
+    p.add_argument('--infra', action='store_true', help='collect with roadside units + V2X in the observation')
     p.add_argument('--noshare', action='store_true', help='train: use the ego-only LiDAR observations (ablation)')
     p.add_argument('--no-scenarios', dest='scenarios', action='store_false', help='no pedestrians / slow cars while collecting')
     p.add_argument('--epochs', type=int, default=30)
