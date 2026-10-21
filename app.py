@@ -21,8 +21,8 @@ SERVER = 'CarlaUE4-Win64-Shipping.exe'
 
 
 def server_running():
-    out = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {SERVER}'], capture_output=True, text=True).stdout
-    return SERVER.lower() in out.lower()
+    out = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {SERVER}', '/NH'], capture_output=True, text=True).stdout
+    return 'carlaue4-win64' in out.lower()  # tasklist cuts long image names ("CarlaUE4-Win64-Shipping.e")
 
 
 def server_answers():
@@ -69,11 +69,32 @@ def shortcut():
     subprocess.run(['powershell', '-NoProfile', '-Command', ps], capture_output=True)
 
 
+def single_instance():
+    '''True for the first launcher; a second one (double click, two shortcuts) would drive the same CARLA world.
+    A named mutex dies with its process, so a crash leaves no stale lock.'''
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+    except Exception:  # shortcut: no guard off Windows, add a lock file if the app is ever run elsewhere
+        return True
+    single_instance.handle = k32.CreateMutexW(None, False, 'Local\CoopDriveLauncher')
+    return k32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+
+
 def main():
     if '--shortcut' in sys.argv:
         return shortcut()
+    if not single_instance():
+        print('Coop-Drive is already running · this window closes in 5 s')
+        time.sleep(5)
+        return
     if not os.path.exists(os.path.join(os.path.expanduser('~'), 'Desktop', 'Coop-Drive.lnk')):
         shortcut()
+    try:  # no idle sleep while the app runs: overnight collection / training must not stop (display may still turn off)
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    except Exception:
+        pass
     port, fails = int(os.environ.get('COOP_TM_PORT', '8100')), 0
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
     while True:
@@ -85,7 +106,10 @@ def main():
         port += 1  # the Traffic Manager of a finished process can linger on its port
         env['COOP_TM_PORT'] = str(port)
         print(f'dashboard · mode {cfg["mode"]} · TM port {port}')
+        started = time.time()
         rc = subprocess.call([sys.executable, '-X', 'faulthandler', 'dashboard.py', '--app'], env=env)
+        if time.time() - started > 600:  # it made progress before failing (CARLA 0.9.10 crashes now and then): fresh retries
+            fails = 0
         if rc == 0:
             return
         if rc == SERVER_RESTART:

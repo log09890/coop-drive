@@ -1,0 +1,142 @@
+{
+ "name": "ablation_expert_v2v",
+ "args": {
+  "town": "Town02",
+  "vn": true,
+  "infra": false,
+  "share": true,
+  "mode": "eval",
+  "driver": "auto",
+  "model": "",
+  "collect_steps": 40000,
+  "noise": 0.2,
+  "scenarios": true,
+  "total_timesteps": 100000,
+  "episode_length": 3000,
+  "bc_reg": 0.5,
+  "eval_name": "ablation_expert_v2v",
+  "eval_episodes": 6,
+  "eval_steps": 2000,
+  "eval_expert": true,
+  "eval_seed": 0,
+  "fullscreen": false,
+  "fps": 60,
+  "page": "overview",
+  "carla_root": "E:/CARLA_0.9.10.1/WindowsNoEditor",
+  "carla_quality": "Low",
+  "queue_total": 14
+ },
+ "summary": {
+  "episodes": 5,
+  "km": 1.386,
+  "route_done_%": 0.0,
+  "progress_%": 35.9,
+  "collisions_per_km": 0.72,
+  "near_miss_s_per_km": 0.0,
+  "red_light_runs_per_km": 2.16,
+  "mean_speed_kmh": 10.1,
+  "mean_abs_dsteer": 0.003,
+  "ends": {
+   "collision": 1,
+   "max_steps": 4
+  }
+ },
+ "episodes": [
+  {
+   "episode": 0,
+   "end": "max_steps",
+   "steps": 2000,
+   "km": 0.12003387706739506,
+   "progress": 0.15897435897435896,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 0,
+   "red_runs": 0,
+   "mean_speed": 4.321219574426217,
+   "jerk": 0.0015905311835076926
+  },
+  {
+   "episode": 1,
+   "end": "collision",
+   "steps": 1867,
+   "km": 0.2612599678382325,
+   "progress": 0.3294871794871795,
+   "route_done": false,
+   "collisions": 1,
+   "near_miss_steps": 0,
+   "red_runs": 1,
+   "mean_speed": 10.075371014650617,
+   "jerk": 0.005261747161710631
+  },
+  {
+   "episode": 2,
+   "end": "max_steps",
+   "steps": 2000,
+   "km": 0.3702893583383411,
+   "progress": 0.4846153846153846,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 0,
+   "red_runs": 1,
+   "mean_speed": 13.33041690018027,
+   "jerk": 0.002687595189447924
+  },
+  {
+   "episode": 4,
+   "end": "max_steps",
+   "steps": 2000,
+   "km": 0.18469880667044358,
+   "progress": 0.23461538461538461,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 0,
+   "red_runs": 0,
+   "mean_speed": 6.649157040135946,
+   "jerk": 0.0020659315830471084
+  },
+  {
+   "episode": 5,
+   "end": "max_steps",
+   "steps": 2000,
+   "km": 0.449864499740833,
+   "progress": 0.5858974358974359,
+   "route_done": false,
+   "collisions": 0,
+   "near_miss_steps": 0,
+   "red_runs": 1,
+   "mean_speed": 16.195121990670017,
+   "jerk": 0.0025449609776192895
+  }
+ ],
+ "summary_raw": {
+  "episodes": 6,
+  "km": 1.386,
+  "route_done_%": 0.0,
+  "progress_%": 29.9,
+  "collisions_per_km": 2.16,
+  "near_miss_s_per_km": 0.0,
+  "red_light_runs_per_km": 2.16,
+  "mean_speed_kmh": 9.4,
+  "mean_abs_dsteer": 0.006,
+  "ends": {
+   "collision": 2,
+   "max_steps": 4
+  }
+ },
+ "episodes_discarded": [
+  {
+   "episode": 3,
+   "end": "collision",
+   "steps": 1,
+   "km": 8.05439056976125e-05,
+   "progress": 0.0,
+   "route_done": false,
+   "collisions": 2,
+   "near_miss_steps": 0,
+   "red_runs": 0,
+   "mean_speed": 5.799161210228099,
+   "jerk": 0.024317429201743845
+  }
+ ],
+ "note": "episodes with a collision in the first 20 steps are spawn overlaps (fixed in dashboard after this run) and are excluded"
+}

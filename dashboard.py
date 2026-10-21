@@ -27,10 +27,11 @@ from simulation.environment import CarlaEnvironment
 from simulation.coop import pose_matrix, to_ego
 from simulation.scenarios import spawn_scenario
 from simulation.vn_traffic import MOTORBIKES, BICYCLES, EVENTS
-from simulation.settings import TM_PORT, COOP_SECTORS, COOP_CORRIDOR, COOP_VEHICLES, COOP_OBS, LIDAR_CHANNELS, LIDAR_POINTS_PER_SECOND
+from simulation.settings import SIGNAL_DIM, INFRA_DIM, TM_PORT, COOP_SECTORS, COOP_CORRIDOR, COOP_VEHICLES, COOP_OBS, LIDAR_CHANNELS, LIDAR_POINTS_PER_SECOND
 from encoder_init import EncodeState
 from autoencoder.decoder import Decoder
 from networks.on_policy.ppo.agent import PPOAgent
+from networks.on_policy.ppo.ppo import ActorCritic
 from parameters import LATENT_DIM
 from bc import expert_action
 from insight import closest_approach, input_sensitivity, group_sensitivity, SessionMetrics
@@ -71,7 +72,9 @@ META = {  # panel: (tag, title)
     'ch_speed': ('CH-01', 'SPEED km/h'), 'ch_ctrl': ('CH-02', 'CONTROL OUTPUT'), 'ch_reward': ('CH-03', 'STEP REWARD'),
     'ch_safety': ('CH-04', 'FRONT GAP m · MIN TTC s'), 'ch_v2x': ('CH-05', 'V2X RATE · LATENCY'), 'ch_value': ('CH-06', 'CRITIC V(s) · π PEDAL'),
     'ch_episodes': ('CH-07', 'EPISODE RETURN'), 'ch_perf': ('CH-08', 'LOOP TIMING ms'),
-    'terminal': ('TTY0', 'TERMINAL'), 'system': ('SYS', 'SYSTEM STATUS')}
+    'terminal': ('TTY0', 'TERMINAL'), 'system': ('SYS', 'SYSTEM STATUS'),
+    'coopcf': ('CF-PI', 'COUNTERFACTUAL DECISION · WHAT COOP CHANGES'), 'radar_cmp': ('LDR-CMP', 'SECTORS · EGO ONLY vs FUSED'),
+    'ch_coop': ('CH-09', 'LANE GAP m · EGO vs SHARED · PEDAL'), 'lidar_ego': ('LDR-00', 'EGO LIDAR ONLY')}
 PAGES = {  # name: [(panel, (x, y, w, h))], page area y 56..660
     'overview': [('chase', (0, 56, 800, 380)), ('lidar', (804, 56, 796, 380)), ('bev', (0, 440, 320, 220)),
                  ('readout', (324, 440, 420, 220)), ('ch_speed', (748, 440, 420, 220)), ('situations', (1172, 440, 428, 220))],
@@ -82,6 +85,8 @@ PAGES = {  # name: [(panel, (x, y, w, h))], page area y 56..660
                 ('v2x', (1172, 56, 428, 300)), ('sensors', (0, 360, 800, 300)), ('lidar', (804, 360, 796, 300))],
     'charts': [(n, (k % 4 * 401, 56 + k // 4 * 304, 397, 300)) for k, n in enumerate(
         ['ch_speed', 'ch_ctrl', 'ch_reward', 'ch_safety', 'ch_v2x', 'ch_value', 'ch_episodes', 'ch_perf'])],
+    'coop': [('coopcf', (0, 56, 532, 300)), ('radar_cmp', (536, 56, 532, 300)), ('ch_coop', (1072, 56, 528, 300)),
+             ('lidar_ego', (0, 360, 796, 300)), ('lidar', (800, 360, 800, 300))],
     'policy': [('policy', (0, 56, 532, 300)), ('reward', (536, 56, 532, 300)), ('train', (1072, 56, 528, 300)),
                ('ch_episodes', (0, 360, 532, 300)), ('ch_reward', (536, 360, 532, 300)), ('metrics', (1072, 360, 528, 300))],
 }
@@ -93,7 +98,7 @@ HELP = [
     ('pipeline <cmd>', 'start · status · resume · retry · skip · stop   (collect→BC→eval→PPO→eval)'),
     ('results', 'table of results/*.json'),
     ('restart | server restart', 'reload the dashboard · restart the CARLA server too'),
-    ('page <name|1-5>', 'overview cameras sensors charts policy   (or F1-F5)'),
+    ('page <name|1-6>', 'overview cameras sensors charts coop policy   (or F1-F6)'),
     ('focus <panel>|off', 'one panel over the whole page'),
     ('spawn <event>', 'ped slow parked ' + ' '.join(EVENTS)),
     ('chaos on|off|<sec>', 'random surprise events near the ego'),
@@ -277,7 +282,7 @@ class Dashboard:
         pygame.key.set_repeat(400, 30)
         info = pygame.display.Info()
         k = min(1.0, info.current_w * 0.96 / W, (info.current_h - 100) * 0.96 / H)
-        self.windowed, self.fullscreen = (int(W * k), int(H * k)), False
+        self.windowed, self.fullscreen, self.toggled = (int(W * k), int(H * k)), False, 0.0
         self.window = pygame.display.set_mode(self.windowed, pygame.RESIZABLE)
         try:
             pygame.display.set_icon(pygame.image.load(os.path.join('assets', 'coopdrive.png')))
@@ -302,7 +307,7 @@ class Dashboard:
         self.episode, self.ep_reward, self.ep_hist = 0, 0.0, []  # ep_hist: returns of finished episodes
         self.driver = 'ppo' if policy_ok and mode != 'collect' else 'expert'
         self.line, self.hist_i, self.page, self.focus = '', 0, cfg['page'] if cfg['page'] in PAGES else 'overview', None
-        self.need_capture = False
+        self.need_capture, self.remote_t, self.composing = False, 0.0, ''
         self.paused = self.quit = self.want_reset = False
         self.metrics, self.timeline, self.sim_t = SessionMetrics(), [], 0.0  # timeline: (sim time s, kind, label)
         self.frames = collections.deque(maxlen=120)  # ~10+ s of half-size window frames for the instant replay
@@ -310,6 +315,7 @@ class Dashboard:
         self.hits, self.hit_ids, self.series = [], [], collections.defaultdict(lambda: collections.deque(maxlen=SERIES))
         self.ms = collections.defaultdict(float)  # latest timings: step, vae, policy, draw
         self.mean, self.value, self.sens, self.sens_step = np.zeros(2), 0.0, None, -1
+        self.cf, self.coop_stats = None, collections.Counter(steps=0)
         self.worst, self.prev_speed, self.accel, self.yaw_rate, self.prev_yaw = None, 0.0, 0.0, 0.0, None
         self.train = {'timestep': 0, 'target': 0, 'episode': 0, 'avg': 0.0, 'updates': 0, 'update_s': 0.0, 'saves': 0,
                       'start': time.time(), 'steps0': 0, 'std': getattr(agent, 'action_std', 0.0), 'note': ''}
@@ -351,6 +357,7 @@ class Dashboard:
             x = o.cpu().unsqueeze(0)
             self.mean = self.agent.old_policy.actor(x)[0].numpy()
             self.value = float(self.agent.old_policy.critic(x)[0])
+        self.counterfactual(env, o)
         ctrl = env.vehicle.get_control()
         yaw = env.vehicle.get_transform().rotation.yaw
         if self.prev_yaw is not None:
@@ -368,6 +375,7 @@ class Dashboard:
                      ('front', min(env.front_obstacle, COOP_CORRIDOR)), ('ttc', self.worst[0] if self.worst else 3.0),
                      ('msg', v2x['msg_per_s']), ('lat', v2x['latency_ms']), ('loss', 100 * v2x['loss']),
                      ('value', self.value), ('pi_pedal', self.mean[1]), ('pi_steer', self.mean[0]),
+                     ('horn', float(getattr(env, 'horn', False))),
                      ('step_ms', self.ms['step']), ('vae_ms', self.ms['vae']), ('pi_ms', self.ms['policy']), ('draw_ms', self.ms['draw'])):
             s[k].append(float(v))
         if env.infra and env.timesteps % 20 == 1:
@@ -389,6 +397,31 @@ class Dashboard:
             self.log(f'collision with {what}', 'ERR')
             return True
         return False
+
+    def counterfactual(self, env, o):
+        '''The policy's action on the same moment with less information: no shared LiDAR, no infrastructure, ego only.'''
+        if not env.lidar_objs or env.lidar_objs[0].latest is None:  # episode over: the env has already removed its sensors
+            return
+        alt = torch.tensor(env.coop_obs_other(), dtype=torch.float32)  # the coop part as the ego's own LiDAR alone sees it
+        o = o.cpu().float()
+        o_alt = torch.cat([o[:100], alt])
+        inf = slice(100 + 2 * (COOP_SECTORS + 1) + SIGNAL_DIM, 100 + 2 * (COOP_SECTORS + 1) + SIGNAL_DIM + INFRA_DIM)
+        no_inf = lambda x: torch.cat([x[:inf.start], torch.zeros(INFRA_DIM), x[inf.stop:]])
+        with torch.no_grad():
+            mu = self.agent.old_policy.actor(torch.stack([o, o_alt, no_inf(o), no_inf(o_alt)])).numpy()
+        self.cf = {'full': mu[0], 'no_v2v': mu[1], 'no_v2i': mu[2], 'ego': mu[3],
+                   'gap_shared': min(env.front_obstacle, COOP_CORRIDOR), 'gap_ego': float(alt[COOP_SECTORS]) * COOP_CORRIDOR,
+                   'sect_ego': alt[:COOP_SECTORS].numpy(), 'sect_full': o[100:100 + COOP_SECTORS].numpy()}
+        c = self.coop_stats
+        c['steps'] += 1
+        c['changed'] += abs(mu[0][1] - mu[3][1]) > 0.2  # coop moves the pedal decision by more than 0.2
+        c['brake_only_coop'] += mu[0][1] < -0.3 <= mu[3][1]  # brakes with coop, would not brake without
+        c['hidden'] += self.cf['gap_shared'] < COOP_CORRIDOR - 0.01 and self.cf['gap_ego'] >= COOP_CORRIDOR - 0.01
+        c['denm'] += env.infra is not None and env.infra.warning_now() is not None
+        for k in ('gap_shared', 'gap_ego'):
+            self.series[k].append(self.cf[k])
+        self.series['ped_full'].append(float(mu[0][1]))
+        self.series['ped_ego'].append(float(mu[3][1]))
 
     def update_rsu_cam(self, env):
         '''Fixed camera on the pole of the nearest RSU (within 90 m), aimed at the ego's approach.'''
@@ -412,7 +445,7 @@ class Dashboard:
         return self.sens
 
     def set_fullscreen(self, on):
-        self.fullscreen = on
+        self.fullscreen, self.toggled = on, time.time()
         self.window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN) if on else pygame.display.set_mode(self.windowed, pygame.RESIZABLE)
         self.log(f"fullscreen {'on' if on else 'off'} · {self.window.get_width()}×{self.window.get_height()} · F11 toggles", 'OUT')
 
@@ -475,6 +508,7 @@ class Dashboard:
         if not self.app:
             self.quit = True
             return
+        self.cfg['queue'] = appcfg.load()['queue']  # jobs queued from outside while this one ran (pipeline extensions)
         nxt = appcfg.next_job(self.cfg)
         self.restart(f'next: {nxt}' + (f" ({len(self.cfg['queue'])} queued)" if self.cfg['queue'] else ''))
 
@@ -487,7 +521,7 @@ class Dashboard:
         cfg = self.cfg
         if not args:
             for k in appcfg.DEFAULTS:
-                if k not in ('job', 'queue'):
+                if k not in ('job', 'queue', 'queue_total'):
                     self.log(f"  {k:16} {str(cfg[k]):34} {'' if k in appcfg.LIVE else '*'} {appcfg.HELP.get(k, '')}", 'OUT')
             return self.log(f"  file {appcfg.PATH if self.app else '(command-line session: not saved)'}", 'OUT')
         try:
@@ -524,6 +558,7 @@ class Dashboard:
         cfg, a = self.cfg, args[0] if args else 'status'
         if a == 'start':
             cfg['queue'] = appcfg.pipeline(cfg['town'])
+            cfg['queue_total'] = len(cfg['queue'])
             appcfg.start_job(cfg, cfg['queue'][0])
             return self.restart(f"pipeline of {len(cfg['queue'])} jobs")
         if a == 'resume':
@@ -703,8 +738,21 @@ class Dashboard:
     def handle_events(self, env):
         '''Keyboard / mouse / window events; True if there were any (the UI then redraws at full fps).'''
         rows = self.term_rows()
+        if time.time() - self.remote_t > 1.0:  # logs/remote.txt: commands from scripts, run like typed ones (one per line)
+            self.remote_t = time.time()
+            path = os.path.join('logs', 'remote.txt')
+            if os.path.exists(path):
+                try:
+                    lines = open(path, encoding='utf-8').read().splitlines()
+                    os.remove(path)
+                except OSError:
+                    lines = []
+                for line in lines:
+                    if line.strip():
+                        self.term.command(line.strip(), self.sim_t)
+                        self.pending.append(line)
         events = pygame.event.get()
-        if any(e.type in (pygame.KEYDOWN, pygame.TEXTINPUT, pygame.MOUSEWHEEL) for e in events):
+        if any(e.type in (pygame.KEYDOWN, pygame.TEXTINPUT, pygame.TEXTEDITING, pygame.MOUSEWHEEL) for e in events):
             self.last_input = time.time()
         for e in events:
             if e.type == pygame.QUIT:
@@ -716,18 +764,19 @@ class Dashboard:
                 self.term.scroll += 3 * e.y
             elif e.type == pygame.KEYDOWN:
                 if e.key == pygame.K_F11:
-                    self.set_fullscreen(not self.fullscreen)
-                elif pygame.K_F1 <= e.key <= pygame.K_F5:
+                    if time.time() - self.toggled > 0.8:  # a mode switch takes a while: key repeat flipped it back and forth
+                        self.set_fullscreen(not self.fullscreen)
+                elif pygame.K_F1 <= e.key <= pygame.K_F1 + len(PAGES) - 1:
                     self.page, self.focus = list(PAGES)[e.key - pygame.K_F1], None
                 elif e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                    line, self.line = self.line, ''
+                    line, self.line, self.composing = self.line + self.composing, '', ''  # an IME word not committed yet counts
                     self.term.scroll = 0
                     if line.strip():
                         self.term.command(line.strip(), self.sim_t)
                         self.pending.append(line)  # run between simulation steps (the sim may be mid-tick)
                     self.hist_i = len(self.term.history)
                 elif e.key == pygame.K_ESCAPE:
-                    self.line, self.replay = '', None
+                    self.line, self.composing, self.replay = '', '', None
                 elif e.key in (pygame.K_UP, pygame.K_DOWN) and self.term.history:
                     hist = self.term.history
                     self.hist_i = max(0, min(len(hist), self.hist_i + (-1 if e.key == pygame.K_UP else 1)))
@@ -737,11 +786,14 @@ class Dashboard:
                 elif e.key == pygame.K_PAGEDOWN:
                     self.term.scroll = max(0, self.term.scroll - rows + 1)
                 elif e.key == pygame.K_TAB:
-                    self.line = self.complete(self.line)
-                elif e.key == pygame.K_BACKSPACE:
+                    self.line, self.composing = self.complete(self.line + self.composing), ''
+                elif e.key == pygame.K_BACKSPACE and not self.composing:  # while composing, the IME edits its own text
                     self.line = self.line[:-1]
-            elif e.type == pygame.TEXTINPUT:  # text after the keyboard layout / IME, one event per character typed
+            elif e.type == pygame.TEXTEDITING:  # Vietnamese IMEs (Telex/VNI) hold a word here until space: show it live
+                self.composing = e.text
+            elif e.type == pygame.TEXTINPUT:  # committed text after the keyboard layout / IME
                 self.line += e.text
+                self.composing = ''
         if env.traffic and env.traffic.log:  # surprise events fired by the chaos timer
             for name in env.traffic.log:
                 self.log(f'chaos event: {name}', 'EVT')
@@ -854,6 +906,11 @@ class Dashboard:
             self.caption(s, f'{cam.size[0]}×{cam.size[1]}  {1 / cam.tick if cam.tick else 20:.0f} Hz  #{cam.n}  age {age:.0f} ms')
             if name == 'chase':
                 self.text(s, f'{env.velocity:5.1f} km/h', (s.get_width() - 12, 12), FG, self.large, right=True)
+                b = getattr(env, 'blinker', 0)
+                if b and time.time() % 0.8 < 0.4:  # blinking arrow, like the dashboard of a real car
+                    self.text(s, '<<' if b < 0 else '>>', (s.get_width() // 2 + (-60 if b < 0 else 40), 12), ORANGE, self.large)
+                if getattr(env, 'horn', False):
+                    self.text(s, 'HORN', (s.get_width() // 2 - 28, 44), MAG, self.large)
             return 'live'
         return draw
 
@@ -972,12 +1029,75 @@ class Dashboard:
         self.text(s, 'outer arc: ∂π_pedal/∂sector', (6, h - 16), (120, 160, 255), self.small)
         return f'min {50 * sectors.min():.1f} m'
 
+    def p_coopcf(self, s, env, o):
+        cf, c = self.cf, self.coop_stats
+        if cf is None:
+            self.text(s, 'awaiting the first step…', (10, 10), DIM, self.small)
+            return '-'
+        self.text(s, 'pedal the policy chooses on this moment, given…', (10, 6), DIM, self.small)
+        rows = [('everything', cf['full'], CYAN), ('no shared LiDAR', cf['no_v2v'], ORANGE), ('no infrastructure', cf['no_v2i'], MAG),
+                ('ego sensors only', cf['ego'], DIM)]
+        for k, (name, mu, col) in enumerate(rows):
+            self.text(s, f'{name:18}', (10, 30 + k * 24), FG, self.mono)
+            self.hbar(s, 190, 34 + k * 24, 170, mu[1], 'pedal', col)
+        d = cf['full'][1] - cf['ego'][1]
+        verdict = ('coop makes it BRAKE harder' if d < -0.2 else 'coop lets it GO' if d > 0.2 else 'same decision without coop')
+        self.text(s, f'Δ pedal (coop − ego) {d:+.2f}  →  {verdict}', (10, 132), RED if d < -0.2 else GREEN if d > 0.2 else DIM, self.bold)
+        n = max(1, c['steps'])
+        stats = [('decision changed by coop', f"{100 * c['changed'] / n:5.1f} % of steps"),
+                 ('brakes only thanks to coop', f"{c['brake_only_coop']} steps"),
+                 ('obstacle seen only via shared LiDAR', f"{100 * c['hidden'] / n:5.1f} % of steps"),
+                 ('DENM warning active', f"{100 * c['denm'] / n:5.1f} % of steps"),
+                 ('lane gap ego / shared', f"{cf['gap_ego']:4.1f} / {cf['gap_shared']:4.1f} m")]
+        for k, (a, b) in enumerate(stats):
+            self.text(s, f'{a:34}', (10, 160 + k * 20), DIM, self.small)
+            self.text(s, b, (290, 160 + k * 20), FG, self.small)
+        return f"{c['steps']} steps"
+
+    def p_radar_cmp(self, s, env, o):
+        cf = self.cf
+        if cf is None:
+            return '-'
+        w, h = s.get_size()
+        n = COOP_SECTORS
+        for k, (title, sect, other) in enumerate((('EGO LIDAR ONLY', cf['sect_ego'], None), ('FUSED (V2V)', cf['sect_full'], cf['sect_ego']))):
+            cx, cy, r = w // 4 + k * w // 2, h // 2 + 10, min(w // 4, h // 2) - 30
+            for ring in (0.5, 1.0):
+                pygame.draw.circle(s, GRID, (cx, cy), int(12 + (r - 12) * ring), 1)
+            for i in range(n):
+                a0, a1 = -math.pi + i * 2 * math.pi / n, -math.pi + (i + 1) * 2 * math.pi / n
+                rr = 12 + (r - 12) * sect[i]
+                revealed = other is not None and sect[i] < other[i] - 0.02  # the fused view sees closer here
+                col = YELLOW if revealed else RED if sect[i] < .15 else ORANGE if sect[i] < .4 else GREEN
+                pygame.draw.polygon(s, col, [(cx, cy)] + [(cx + rr * math.sin(a), cy - rr * math.cos(a)) for a in np.linspace(a0, a1, 4)])
+            pygame.draw.polygon(s, FG, [(cx, cy - 8), (cx - 5, cy + 6), (cx + 5, cy + 6)])
+            self.text(s, title, (cx - 70, 6), FG, self.small)
+        self.text(s, '■ yellow: sector the coop cars see closer than the ego', (8, h - 18), YELLOW, self.small)
+        revealed = int((cf['sect_full'] < cf['sect_ego'] - 0.02).sum())
+        return f'{revealed} sectors revealed'
+
+    def p_ch_coop(self, s, env, o):
+        self.chart(s, ['gap_ego', 'gap_shared', 'ped_full', 'ped_ego'], [DIM, CYAN, GREEN, ORANGE], ['gap ego', 'gap shared', 'π full', 'π ego'],
+                   '', -1, COOP_CORRIDOR)
+        return '30 s window'
+
+    def p_lidar_ego(self, s, env, o):
+        l = env.lidar_objs[0].latest
+        if l is None:
+            return 'no scan'
+        img, marks = self.cached(('lidar_ego', s.get_size()), env, lambda: lidar_render([l[0]], [l[1]], l[1], s.get_size()))
+        s.blit(pygame.surfarray.make_surface(img), (0, 0))
+        self.caption(s, f'○ ego only     {len(l[0]):,} pts — compare with the fused view on the right')
+        return '1 sensor'
+
     def p_policy(self, s, env, o):
         steer_s, pedal_s = self.sensitivity(env, o)
         self.text(s, f"driver {self.driver.upper()}   mode {self.mode.upper()}   σ_action {getattr(self.agent, 'action_std', 0):.3f}",
                   (10, 6), CYAN if self.policy_ok else ORANGE, self.mono)
         self.hbar(s, 10, 32, 200, self.mean[0], 'μ steer', ORANGE)
         self.hbar(s, 10, 50, 200, self.mean[1], 'μ pedal', GREEN)
+        if len(self.mean) > 2:
+            self.hbar(s, 280, 32, 120, self.mean[2], 'μ horn', MAG)
         self.hbar(s, 10, 68, 200, np.tanh(self.value / 10), 'V(s)/10', CYAN)
         self.text(s, f'V(s) {self.value:+.3f}   obs dim {100 + COOP_OBS}   actor ∂ via autograd', (10, 86), DIM, self.small)
         groups = group_sensitivity(pedal_s, LATENT_DIM, COOP_SECTORS)
@@ -1030,7 +1150,9 @@ class Dashboard:
                 ('episode', f"{tr['episode']}  (this session {self.episode})"),
                 ('avg return', f"{tr['avg']:+.2f}"), ('last return', f"{self.ep_hist[-1]:+.2f}" if self.ep_hist else '-'),
                 ('action σ', f"{tr['std']:.3f}"), ('rollout buffer', f'{mem:,} steps'),
-                ('PPO updates', f"{tr['updates']}  (last {tr['update_s']:.1f} s)"), ('checkpoints', f"{tr['saves']} saved"),
+                ('PPO updates', f"{tr['updates']} · last {tr['update_s']:.1f} s · {tr['saves']} saved"),
+                ('last update', f"KL {tr['ppo']['approx_kl']:.4f} · clip {100 * tr['ppo']['clip_frac']:.0f}% · V {tr['ppo']['value_loss']:.3f} · BC {tr['ppo']['bc_loss']:.3f}"
+                 if tr.get('ppo') else '-'),
                 ('throughput', f'{rate:.1f} steps/s   RTF {rate * 0.05:.2f}×'),
                 ('elapsed · ETA', f'{el / 60:.1f} min · {eta / 60:.0f} min' if eta else f'{el / 60:.1f} min'),
                 ('job', self.status or '-'),
@@ -1206,7 +1328,11 @@ class Dashboard:
         pygame.draw.line(s, EDGE, (0, y - 4), (w, y - 4))
         pw = self.text(s, f'coop@carla:{self.config.split()[0]}$ ', (6, y), GREEN, self.mono)
         cur = '█' if time.time() % 1 < .5 else ' '
-        self.text(s, self.line + cur, (6 + pw, y), FG, self.mono)
+        lw = self.text(s, self.line, (6 + pw, y), FG, self.mono)
+        cw = self.text(s, self.composing, (6 + pw + lw, y), YELLOW, self.mono) if self.composing else 0
+        if self.composing:
+            pygame.draw.line(s, YELLOW, (6 + pw + lw, y + 15), (6 + pw + lw + cw, y + 15))  # IME composition, underlined
+        self.text(s, cur, (6 + pw + lw + cw, y), FG, self.mono)
         if self.term.scroll:
             self.text(s, f'↑ {self.term.scroll} lines · PgDn', (w - 8, y), ORANGE, self.small, right=True)
         return f'● REC {os.path.basename(self.term.path)}'
@@ -1231,7 +1357,8 @@ class Dashboard:
                 ('EDGE', RED if denm is not None else GREEN if env.infra else (50, 60, 70),
                  f"DENM {env.infra.warning['kind']} {denm:.1f} s" if denm is not None else 'conflict monitor idle' if env.infra else 'disabled', ''),
                 ('POLICY', GREEN if self.policy_ok else ORANGE, f'{self.driver} · {self.ms["policy"]:4.2f} ms', f'V {self.value:+.2f}'),
-                ('CONTROL', RED if ctrl.brake > 0 else GREEN, f'str {ctrl.steer:+.2f} thr {ctrl.throttle:.2f} brk {ctrl.brake:.2f}', ''),
+                ('CONTROL', RED if ctrl.brake > 0 else GREEN, f'str {ctrl.steer:+.2f} thr {ctrl.throttle:.2f} brk {ctrl.brake:.2f}',
+                 ('HORN ' if getattr(env, 'horn', False) else '') + {-1: '<< blink L', 1: 'blink R >>'}.get(getattr(env, 'blinker', 0), '')),
                 ('RENDER', GREEN if self.fps > 10 else ORANGE, f'page {self.page} · {self.ms["draw"]:4.1f} ms', f'{self.fps:4.1f} fps'),
                 ('LOGGER', GREEN, f'{len(self.term.lines)} lines', 'REC')]
         for k, (name, col, a, b) in enumerate(rows):
@@ -1245,7 +1372,7 @@ class Dashboard:
     def panel_fn(self, name):
         if name in CAMS or name == 'rsu':
             return self.p_camera(name)
-        if name.startswith('ch_'):
+        if name.startswith('ch_') and name != 'ch_coop':
             return self.p_episodes if name == 'ch_episodes' else self.p_chart(name)
         return getattr(self, 'p_' + name)
 
@@ -1271,20 +1398,20 @@ class Dashboard:
                   (x + 16, 8), FG, self.mono)
         right = f"sim {self.sim_t:8.2f} s   {time.strftime('%Y-%m-%d %H:%M:%S')}"
         self.text(s, right, (W - 10, 8), FG, self.mono, right=True)
-        q, n = self.cfg['queue'], len(appcfg.pipeline())
+        q, n = self.cfg['queue'], self.cfg['queue_total'] or len(appcfg.pipeline())
         job = f' {n - len(q) + 1}/{n}' if q and q[0] == self.cfg['job'] else ''
         state, scol = ('PAUSED', ORANGE) if self.paused else (self.mode.upper() + job, GREEN if self.mode == 'drive' else MAG)
         sw = self.text(s, state, (W - 330, 7), scol, self.bold, right=True)
         self.led(s, (W - 342 - sw, 15), scol)
         # page tabs
         for k, name in enumerate(PAGES):
-            rx = 6 + k * 150
+            rx = 6 + k * 130
             on = name == self.page and not self.focus
-            pygame.draw.rect(s, (28, 40, 56) if on else PANEL, (rx, HEAD + 3, 146, TABS - 5))
-            pygame.draw.rect(s, CYAN if on else EDGE, (rx, HEAD + 3, 146, TABS - 5), 1)
+            pygame.draw.rect(s, (28, 40, 56) if on else PANEL, (rx, HEAD + 3, 126, TABS - 5))
+            pygame.draw.rect(s, CYAN if on else EDGE, (rx, HEAD + 3, 126, TABS - 5), 1)
             self.text(s, f'F{k + 1}  {name.upper()}', (rx + 10, HEAD + 6), CYAN if on else DIM, self.small)
         if self.focus:
-            self.text(s, f'FOCUS {self.focus} · focus off', (6 + len(PAGES) * 150 + 10, HEAD + 6), ORANGE, self.small)
+            self.text(s, f'FOCUS {self.focus} · focus off', (6 + len(PAGES) * 130 + 10, HEAD + 6), ORANGE, self.small)
         self.text(s, f'obs {100 + COOP_OBS} · sectors {COOP_SECTORS} · coop {COOP_VEHICLES} · torch {torch.__version__.split("+")[0]} · '
                      f'{"cuda" if torch.cuda.is_available() else "cpu"}', (W - 10, HEAD + 6), DIM, self.small, right=True)
         layout = [(self.focus, PAGE_AREA)] if self.focus else PAGES[self.page]
@@ -1411,6 +1538,15 @@ def main():
         tr.update(timestep=meta['timestep'], steps0=meta['timestep'], episode=meta['episode'], avg=meta['cumulative_score'],
                   target=job['target'], std=agent.action_std)
         dash.status = f"fine-tune → {job['target']:,} steps"
+        bc_actor, bc_path = None, f'data/bc_policy_{town}.pth'
+        if cfg['bc_reg'] > 0 and os.path.exists(bc_path):  # anchor: keeps the fine-tune near the BC policy
+            net = ActorCritic(100 + COOP_OBS, agent.action_dim, agent.action_std)
+            net.load_state_dict(torch.load(bc_path))
+            bc_actor = net.actor.eval()
+            dash.log(f"BC anchor {bc_path} · coefficient {cfg['bc_reg']}", 'INFO')
+        curve = os.path.join('logs', f'train_{dash.run_id}.csv')  # learning curve: one row per PPO update
+        with open(curve, 'w') as f:
+            f.write('update,episode,timestep,avg_return,last_return,samples,sgd_steps,policy_loss,value_loss,entropy,approx_kl,clip_frac,bc_loss,grad_norm,mean_reward,seconds\n')
         dash.log(f"PPO fine-tune at timestep {meta['timestep']:,} · episode {meta['episode']} · σ {agent.action_std} · "
                  f"target {job['target']:,} · checkpoints {chkpt_dir}", 'INFO')
     if mode == 'collect':
@@ -1478,6 +1614,7 @@ def main():
         client.apply_batch_sync([carla.command.DestroyActor(a) for a in env.sensor_list + env.actor_list], True)
         env.sensor_list.clear(); env.actor_list.clear(); env.riders.clear(); env.remove_sensors()
 
+    retries = 0
     try:
         while not dash.quit:
             if mode == 'eval':
@@ -1486,11 +1623,17 @@ def main():
                     dash.log('SUMMARY ' + ' · '.join(f'{k} {v}' for k, v in out['summary'].items()), 'INFO')
                     dash.finish_job(f"results/{cfg['eval_name']}.json")
                     break
-                random.seed(seed * 1000 + len(eps)); np.random.seed(seed * 1000 + len(eps))  # same route + events per episode
+                k = seed * 1000 + len(eps) + 100003 * retries  # same route + events per episode; a retry moves to the next seed
+                random.seed(k); np.random.seed(k % (2 ** 32))
             observation = env.reset()
             if observation is None:
-                dash.log('reset failed (no free spawn point?), retrying', 'WARN')
+                retries += 1  # the same seed would pick the same occupied spawn point forever
+                dash.log(f'reset failed (no free spawn point?), retry {retries}', 'WARN')
+                if retries % 3 == 0:
+                    for _ in range(20):  # let the traffic move off the spawn points
+                        world.tick()
                 continue
+            retries = 0
             dash.new_episode(env)
             o = encode.process(observation)
             alt = env.coop_obs_other() if data else None
@@ -1531,7 +1674,7 @@ def main():
                 t0 = time.time()
                 if dash.driver == 'expert':
                     action = expert_action(env)
-                    executed = action + np.array([np.random.normal(0, cfg['noise']), 0.0]) if mode == 'collect' else action
+                    executed = action + np.r_[np.random.normal(0, cfg['noise']), np.zeros(len(action) - 1)] if mode == 'collect' else action
                 elif mode == 'eval':
                     with torch.no_grad():
                         action = executed = agent.old_policy.actor(o.cpu()).numpy()  # mean action: deterministic
@@ -1606,9 +1749,13 @@ def main():
                 if len(data[0]) >= cfg['collect_steps']:
                     dash.finish_job(f'{len(data[0]):,} steps')
             elif mode == 'eval':
-                eps.append(stats.record(len(eps), dash.hit_ids))
-                e = eps[-1]
-                dash.log(f"eval ep {e['episode']}: {e['end']} · {e['steps']} steps · {e['km'] * 1000:.0f} m · collisions {e['collisions']}", 'INFO')
+                e = stats.record(len(eps), dash.hit_ids)
+                if e['collisions'] and e['steps'] < 20:  # hit within 1 s of spawning: a spawn overlap, not the driver's doing
+                    retries += 1  # same episode again on the next seed
+                    dash.log(f"eval ep {e['episode']}: collision at spawn ({e['steps']} steps) · discarded, rerun", 'WARN')
+                else:
+                    eps.append(e)
+                    dash.log(f"eval ep {e['episode']}: {e['end']} · {e['steps']} steps · {e['km'] * 1000:.0f} m · collisions {e['collisions']}", 'INFO')
             elif mode == 'train':
                 tr['episode'] += 1
                 tr['avg'] = (tr['avg'] * (tr['episode'] - 1) + dash.ep_reward) / tr['episode']
@@ -1617,13 +1764,19 @@ def main():
                     dash.log(f"PPO update on {len(agent.memory.rewards):,} steps…", 'INFO')
                     dash.draw(env, o)
                     t0 = time.time()
-                    agent.learn()
+                    st = agent.learn(bc_actor=bc_actor, bc_coef=cfg['bc_reg'] if bc_actor is not None else 0.0)
+                    tr['ppo'] = st
+                    with open(curve, 'a') as f:
+                        f.write(','.join(str(round(v, 6)) for v in (tr['updates'] + 1, tr['episode'], tr['timestep'], tr['avg'], dash.ep_reward,
+                                st['samples'], st['sgd_steps'], st['policy_loss'], st['value_loss'], st['entropy'], st['approx_kl'],
+                                st['clip_frac'], st['bc_loss'], st['grad_norm'], st['mean_reward'], time.time() - t0)) + '\n')
                     agent.chkpt_save()
                     save_meta(chkpt_dir, state, new_file=False)
                     tr['updates'] += 1
                     tr['update_s'] = time.time() - t0
                     tr['saves'] += 1
-                    dash.log(f"update {tr['updates']} done in {tr['update_s']:.1f} s · checkpoint saved · avg return {tr['avg']:+.2f}", 'INFO')
+                    dash.log(f"update {tr['updates']} done in {tr['update_s']:.1f} s · {st['sgd_steps']} SGD steps · KL {st['approx_kl']:.4f} · "
+                             f"clip {100 * st['clip_frac']:.0f}% · V loss {st['value_loss']:.3f} · BC {st['bc_loss']:.4f} · avg return {tr['avg']:+.2f}", 'INFO')
                 if tr['episode'] % 100 == 0:
                     agent.save()
                     save_meta(chkpt_dir, state, new_file=True)

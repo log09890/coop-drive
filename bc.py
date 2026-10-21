@@ -10,6 +10,7 @@ import math
 import os
 import pickle
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,21 +31,41 @@ def expert_action(env, lookahead=6):
     angle = math.atan2(target.y - t.location.y, target.x - t.location.x) - math.atan2(fwd.y, fwd.x)
     angle = (angle + math.pi) % (2 * math.pi) - math.pi  # left-handed UE4: positive = target on the right = steer right
     steer = float(np.clip(1.5 * angle, -1, 1))
-    # reward peaks at 15-22 km/h (>25 ends the episode); slow down linearly to a stop 4 m before an obstacle in the lane
+    # reward peaks at 15-22 km/h (>25 ends the episode). Something in the lane corridor: follow it and stop ~3.5 m behind
+    # if it stays; a bike just crossing (in and out within CROSS_S) only makes us ease off, it does not stop the car.
     # shortcut: the corridor is straight ahead, so in sharp curves it can miss/catch things; use the route waypoints if that matters
-    target_speed = min(20.0, max(0.0, (env.front_obstacle - 4.0) * 1.5))  # creep with the flow: VN traffic never leaves 7 m
+    front, now = env.front_obstacle, env.now()
+    since = getattr(env, 'blocked_since', None)
+    env.blocked_since = (now if since is None or since > now else since) if front < 8.0 else None  # since > now: new episode
+    lingering = env.blocked_since is not None and now - env.blocked_since >= CROSS_S
+    follow = (front - 3.5) * 2.0
+    target_speed = min(20.0, max(0.0, follow if lingering else max(follow, min(8.0, (front - STOP_GAP) * 3.0))))
+    urgent = front < STOP_GAP
     if env.vehicle.is_at_traffic_light() and env.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red:
         target_speed = 0.0  # only reachable in --vn mode, elsewhere the env turns the ego's lights green
     warn = env.infra.warning_now() if getattr(env, 'infra', None) else None
     if warn is not None:  # DENM from the junction edge server: someone will cut our path in `warn` s
-        target_speed = min(target_speed, 0.0 if warn < 1.5 else 6.0)
-    if target_speed < 1:
+        urgent = urgent or warn < 1.0
+        target_speed = min(target_speed, 0.0 if warn < 1.0 else 10.0)
+    if urgent:
         pedal = -1.0
-    elif env.velocity > target_speed + 2:
-        pedal = -float(np.clip(0.15 * (env.velocity - target_speed), 0.2, 1))
+    elif target_speed < 1 and env.velocity < 1:
+        pedal = -0.5  # hold at a standstill
+    elif env.velocity > target_speed + 1:
+        pedal = -float(np.clip(0.08 * (env.velocity - target_speed), 0.15, 1))  # graded: hard only when far too fast
     else:
         pedal = float(np.clip(0.4 + 0.15 * (target_speed - env.velocity), 0, 1))
-    return np.array([steer, pedal])
+    # horn, Vietnamese style: a short tap every 2 s while someone dawdles in the lane close ahead, or on a DENM
+    honk = -1.0
+    if (lingering and front < 8.0 and env.velocity < 10) or warn is not None:
+        if now - getattr(env, 'last_honk', -9.0) > 2.0 or now < getattr(env, 'last_honk', -9.0):
+            env.last_honk = now
+        honk = 1.0 if now - env.last_honk < 0.3 else -1.0
+    return np.array([steer, pedal, honk])
+
+
+STOP_GAP = 2.5  # m: closer than this in the lane -> full brake at once
+CROSS_S = 0.3   # s an obstacle must stay in the lane corridor before the expert stops for it
 
 
 def collect(args):
@@ -65,7 +86,7 @@ def collect(args):
             o = encode.process(observation).cpu().numpy()
             o_alt = np.concatenate([o[:100], alt])
             a = expert_action(env)
-            noisy = a + np.array([np.random.normal(0, args.noise), 0.0])  # execute noisy, label clean: data also covers recoveries
+            noisy = a + np.r_[np.random.normal(0, args.noise), np.zeros(len(a) - 1)]  # execute noisy, label clean: data also covers recoveries
             result = env.step(noisy)
             if result is None:  # env crashed and cleaned up, start a new episode
                 break
@@ -110,7 +131,7 @@ def train(args):
     ret = discounted_returns(d['rew'], d['done'], GAMMA)
     ret = torch.tensor((ret - ret.mean()) / (ret.std() + 1e-7))  # PPO normalizes its critic targets the same way
     assert obs.shape[1] == 100 + COOP_OBS, 'data was collected with another COOP_SECTORS/COOP_OBS, collect again'
-    policy = ActorCritic(obs.shape[1], 2, args.action_std)
+    policy = ActorCritic(obs.shape[1], act.shape[1], args.action_std)
     opt = torch.optim.Adam(policy.parameters(), lr=1e-3)
     idx = torch.randperm(len(obs))
     val, tr = idx[:len(idx) // 10], idx[len(idx) // 10:]
@@ -130,7 +151,13 @@ def train(args):
     # Become the only/latest checkpoint so `--load-checkpoint True` / `--train False` pick it up
     model_dir, meta_dir = PPO_CHECKPOINT_DIR + args.town, f'checkpoints/PPO_coop/{args.town}'
     os.makedirs(model_dir, exist_ok=True); os.makedirs(meta_dir, exist_ok=True)
-    assert not os.listdir(model_dir), f'{model_dir} is not empty, move old models away first'
+    for d in (model_dir, meta_dir):  # older models / training counters: moved aside, never overwritten
+        if os.listdir(d):
+            old = f"{d}_backup/{time.strftime('%Y%m%d-%H%M%S')}"
+            os.makedirs(old)
+            for f in os.listdir(d):
+                os.replace(os.path.join(d, f), os.path.join(old, f))
+            print(f'moved the previous contents of {d} to {old}')
     torch.save(policy.state_dict(), f'{model_dir}/ppo_policy_0_.pth')
     torch.save(policy.state_dict(), f'data/bc_policy_{args.town}.pth')  # PPO overwrites ppo_policy_0 later, keep a copy
     with open(f'{meta_dir}/checkpoint_ppo_0.pickle', 'wb') as f:

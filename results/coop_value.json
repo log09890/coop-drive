@@ -1,0 +1,234 @@
+{
+ "data": "E:/carla_dl/bc_final.npz",
+ "info": {
+  "steps": 40000,
+  "episodes": 19,
+  "hidden_obstacle_%": 0.56,
+  "shared_obstacle_closer_%": 1.74,
+  "denm_active_%": 8.4,
+  "critical_%": 9.85,
+  "expert_hard_brake_%": 19.5
+ },
+ "summary": {
+  "ego": {
+   "pedal_mse": [
+    0.0646,
+    0.0054
+   ],
+   "critical_pedal_mse": [
+    0.2081,
+    0.0307
+   ],
+   "brake_recall": [
+    0.7833,
+    0.1915
+   ],
+   "brake_precision": [
+    0.8423,
+    0.0774
+   ],
+   "brake_lead_s": [
+    1.2742,
+    0.2693
+   ]
+  },
+  "v2v": {
+   "pedal_mse": [
+    0.059,
+    0.0032
+   ],
+   "critical_pedal_mse": [
+    0.1837,
+    0.038
+   ],
+   "brake_recall": [
+    0.8045,
+    0.1656
+   ],
+   "brake_precision": [
+    0.8337,
+    0.0773
+   ],
+   "brake_lead_s": [
+    1.3148,
+    0.1961
+   ]
+  },
+  "v2i": {
+   "pedal_mse": [
+    0.0509,
+    0.0046
+   ],
+   "critical_pedal_mse": [
+    0.1107,
+    0.0078
+   ],
+   "brake_recall": [
+    0.8186,
+    0.084
+   ],
+   "brake_precision": [
+    0.85,
+    0.0722
+   ],
+   "brake_lead_s": [
+    1.0675,
+    0.2209
+   ]
+  },
+  "full": {
+   "pedal_mse": [
+    0.0466,
+    0.0051
+   ],
+   "critical_pedal_mse": [
+    0.0911,
+    0.0098
+   ],
+   "brake_recall": [
+    0.8504,
+    0.0626
+   ],
+   "brake_precision": [
+    0.8402,
+    0.0826
+   ],
+   "brake_lead_s": [
+    1.1252,
+    0.1706
+   ]
+  }
+ },
+ "runs": {
+  "ego": [
+   {
+    "mse": 0.06173864006996155,
+    "pedal_mse": 0.06314940005540848,
+    "critical_pedal_mse": 0.1725536286830902,
+    "brake_recall": 0.9559633027522936,
+    "brake_precision": 0.9501519756838905,
+    "brake_lead_s": 1.5227272727272727,
+    "missed_onsets": 2,
+    "onsets": 13
+   },
+   {
+    "mse": 0.06639229506254196,
+    "pedal_mse": 0.07187756896018982,
+    "critical_pedal_mse": 0.20441699028015137,
+    "brake_recall": 0.8776978417266187,
+    "brake_precision": 0.7721518987341772,
+    "brake_lead_s": 1.4000000000000001,
+    "missed_onsets": 2,
+    "onsets": 26
+   },
+   {
+    "mse": 0.06348426640033722,
+    "pedal_mse": 0.058817166835069656,
+    "critical_pedal_mse": 0.24742625653743744,
+    "brake_recall": 0.5163636363636364,
+    "brake_precision": 0.8045325779036827,
+    "brake_lead_s": 0.9000000000000001,
+    "missed_onsets": 9,
+    "onsets": 17
+   }
+  ],
+  "v2v": [
+   {
+    "mse": 0.05994515120983124,
+    "pedal_mse": 0.05733047053217888,
+    "critical_pedal_mse": 0.1435018628835678,
+    "brake_recall": 0.9577981651376147,
+    "brake_precision": 0.9428055388320289,
+    "brake_lead_s": 1.45,
+    "missed_onsets": 2,
+    "onsets": 13
+   },
+   {
+    "mse": 0.06345651298761368,
+    "pedal_mse": 0.06345321238040924,
+    "critical_pedal_mse": 0.17297911643981934,
+    "brake_recall": 0.8812949640287769,
+    "brake_precision": 0.7740916271721959,
+    "brake_lead_s": 1.456818181818182,
+    "missed_onsets": 4,
+    "onsets": 26
+   },
+   {
+    "mse": 0.061865366995334625,
+    "pedal_mse": 0.05627312511205673,
+    "critical_pedal_mse": 0.234602689743042,
+    "brake_recall": 0.5745454545454546,
+    "brake_precision": 0.7841191066997518,
+    "brake_lead_s": 1.0375,
+    "missed_onsets": 9,
+    "onsets": 17
+   }
+  ],
+  "v2i": [
+   {
+    "mse": 0.055007729679346085,
+    "pedal_mse": 0.04562699794769287,
+    "critical_pedal_mse": 0.10366368293762207,
+    "brake_recall": 0.8844036697247707,
+    "brake_precision": 0.9519420671494404,
+    "brake_lead_s": 1.1958333333333335,
+    "missed_onsets": 1,
+    "onsets": 13
+   },
+   {
+    "mse": 0.06182283163070679,
+    "pedal_mse": 0.056871529668569565,
+    "critical_pedal_mse": 0.12152916193008423,
+    "brake_recall": 0.8714028776978417,
+    "brake_precision": 0.7942622950819672,
+    "brake_lead_s": 1.25,
+    "missed_onsets": 2,
+    "onsets": 26
+   },
+   {
+    "mse": 0.058663830161094666,
+    "pedal_mse": 0.05028965696692467,
+    "critical_pedal_mse": 0.10683698207139969,
+    "brake_recall": 0.7,
+    "brake_precision": 0.8037578288100209,
+    "brake_lead_s": 0.7566666666666666,
+    "missed_onsets": 2,
+    "onsets": 17
+   }
+  ],
+  "full": [
+   {
+    "mse": 0.05332097411155701,
+    "pedal_mse": 0.03965771570801735,
+    "critical_pedal_mse": 0.07963504642248154,
+    "brake_recall": 0.8954128440366973,
+    "brake_precision": 0.9556135770234987,
+    "brake_lead_s": 1.3181818181818181,
+    "missed_onsets": 2,
+    "onsets": 13
+   },
+   {
+    "mse": 0.060895636677742004,
+    "pedal_mse": 0.05171274021267891,
+    "critical_pedal_mse": 0.10356687754392624,
+    "brake_recall": 0.8938848920863309,
+    "brake_precision": 0.7669753086419753,
+    "brake_lead_s": 1.154,
+    "missed_onsets": 1,
+    "onsets": 26
+   },
+   {
+    "mse": 0.058491144329309464,
+    "pedal_mse": 0.048359233886003494,
+    "critical_pedal_mse": 0.09019031375646591,
+    "brake_recall": 0.7618181818181818,
+    "brake_precision": 0.7980952380952381,
+    "brake_lead_s": 0.9033333333333334,
+    "missed_onsets": 2,
+    "onsets": 17
+   }
+  ]
+ },
+ "seeds": 3,
+ "epochs": 15
+}

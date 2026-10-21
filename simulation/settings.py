@@ -35,8 +35,10 @@ COOP_VEHICLES = 5
 COOP_RANGE = 50.0
 COOP_CORRIDOR = 20.0  # lane-ahead obstacle check length (m), one extra obs value
 # (sectors + corridor) now and their change since the last step, + the V2X view from the infrastructure (zeros if off)
+VN_RED_WAIT = 3.0  # s the ego waits at a red light in VN mode before its light is switched to green
 INFRA_DIM = 24  # = simulation.infrastructure.INFRA_DIM
-COOP_OBS = 2 * (COOP_SECTORS + 1) + INFRA_DIM if COOP_SECTORS else 0
+SIGNAL_DIM = 19  # ego blinker L/R + horn, then the 4 nearest vehicles ahead: (along, lateral, left blinker, right blinker)
+COOP_OBS = 2 * (COOP_SECTORS + 1) + SIGNAL_DIM + INFRA_DIM if COOP_SECTORS else 0
 LIDAR_CHANNELS = 32
 LIDAR_LOWER_FOV = -25.0
 LIDAR_POINTS_PER_SECOND = 100000

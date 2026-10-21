@@ -9,6 +9,17 @@ import numpy as np
 from simulation.connection import carla
 from simulation.settings import TM_PORT
 
+HIDDEN_BEHIND, HIDDEN_FAR = -15.0, 45.0  # new actors only appear >15 m behind the ego or >45 m from it
+HORN_REACH, HORN_COOLDOWN = 20.0, 4.0     # m ahead a horn is heard; s before the same rider reacts again
+
+
+def hidden(env, loc):
+    '''True where something can appear without popping up in front of the ego (behind it, or far away).'''
+    t = env.vehicle.get_transform()
+    f, d = t.get_forward_vector(), loc - t.location
+    return d.x * f.x + d.y * f.y < HIDDEN_BEHIND or math.hypot(d.x, d.y) > HIDDEN_FAR
+
+
 MOTORBIKES = ('vehicle.yamaha.yzf', 'vehicle.kawasaki.ninja', 'vehicle.harley-davidson.low_rider')
 BICYCLES = ('vehicle.bh.crossbike', 'vehicle.gazelle.omafiets', 'vehicle.diamondback.century')
 CARS = ('vehicle.audi.a2', 'vehicle.toyota.prius', 'vehicle.nissan.micra', 'vehicle.mini.cooperst', 'vehicle.seat.leon')
@@ -19,7 +30,7 @@ STYLE = {'moto': (30, 60, (1.5, 3.0), (-40, 10)), 'bike': (40, 70, (1.5, 2.5), (
 
 class VNTraffic:
 
-    def __init__(self, client, world, n_motorbikes=80, n_bicycles=8, n_cars=12, n_walkers=50, avoid=None, seed=0):
+    def __init__(self, client, world, n_motorbikes=50, n_bicycles=8, n_cars=12, n_walkers=50, avoid=None, seed=0):
         self.client, self.world, self.rng = client, world, random.Random(seed)
         self.map = world.get_map()  # get_map() re-downloads the whole OpenDRIVE map on every call
         self.tm = client.get_trafficmanager(TM_PORT)
@@ -56,7 +67,8 @@ class VNTraffic:
         self.swarm = {}  # vehicle id -> (light id, cells) for vehicles packed in front of a red light
         self.ticks = self.rescued = 0
         self.stall = {}  # vehicle id -> ticks standing still without a reason
-        self.chaos = 5.0  # mean seconds between random surprise events near the ego, 0 = off
+        self.chaos = 8.0  # mean seconds between random surprise events near the ego, 0 = off
+        self.honked = {}  # vehicle id -> sim time it last reacted to the ego's horn
         self.next_event = int(self.chaos / DT)
         self.log = []  # event names for the dashboard
 
@@ -102,7 +114,7 @@ class VNTraffic:
     def _recycle(self, env):
         '''Keep the traffic dense where it matters: motorbikes far from the ego reappear 25-70 m from it.'''
         ego = env.vehicle.get_location()
-        near = self._near_ego_slots(env)
+        near = [s for s in self._near_ego_slots(env) if hidden(env, s.location)]  # out of the ego's view
         occupied = [a.get_location() for a in self.world.get_actors().filter('vehicle.*')]
         for v in self.motorbikes:
             if near and v.id not in self.swarm and v.get_location().distance(ego) > 90:
@@ -115,7 +127,7 @@ class VNTraffic:
         """Safety net: a vehicle knocked over or launched off the road is put back on a free lane spot."""
         occupied = [o for _, o in env.vehicle_locs]
         riding = {r.v.id for r in env.riders if r.v}
-        far = self._near_ego_slots(env, 40, 90) or self.slots
+        far = [s for s in self._near_ego_slots(env, 40, 90) if hidden(env, s.location)] or self.slots
         for a in self.world.get_actors().filter('vehicle.*'):
             if a.id == env.vehicle.id:
                 continue
@@ -125,7 +137,7 @@ class VNTraffic:
             waiting = a.id in self.swarm or a.id in riding or (
                 a.is_at_traffic_light() and a.get_traffic_light_state() != carla.TrafficLightState.Green)
             self.stall[a.id] = self.stall.get(a.id, 0) + 10 if (vel.x ** 2 + vel.y ** 2) < 0.25 and not waiting else 0
-            stuck = self.stall[a.id] > 400  # 20 s still for no reason (TM dead end, wedged between bikes)
+            stuck = self.stall[a.id] > 200  # 10 s still for no reason (TM dead end, wedged between bikes, stranded off the lane)
             if not stuck and abs(t.rotation.pitch) < 35 and abs(t.rotation.roll) < 35 and -1.0 < t.location.z - wp.transform.location.z < 1.5:
                 continue
             self.stall[a.id] = 0
@@ -145,9 +157,11 @@ class VNTraffic:
             self.motorbikes = [v for v in self.motorbikes if v.is_alive]
         if self.chaos and self.ticks >= self.next_event:
             self.next_event = self.ticks + int(self.chaos * self.rng.uniform(0.5, 1.5) / DT)  # irregular: harder to anticipate
-            name = self.rng.choice(list(EVENTS))
+            name = self.rng.choice(CHAOS)
             if EVENTS[name](env):
                 self.log.append(name)
+        if getattr(env, 'horn', False):
+            self._hear_horn(env)
         if self.ticks % 40 == 20:
             self._recycle(env)
         if self.ticks % 10 == 5:
@@ -157,6 +171,31 @@ class VNTraffic:
         if self.ticks % 40 == 0 and self.motorbikes:
             for v in self.rng.sample(self.motorbikes, max(1, len(self.motorbikes) // 5)):
                 self.tm.force_lane_change(v, self.rng.random() < 0.5)
+
+    def _hear_horn(self, env):
+        '''Two-wheelers just ahead of a honking ego move to the right edge and speed up for 2.5 s (at most 3 per honk).'''
+        t = self.ticks * DT
+        tr = env.vehicle.get_transform()
+        f = tr.get_forward_vector()
+        riders = {r.v.id: r for r in env.riders if r.v}
+        heard = 0
+        for v in self.motorbikes:
+            if heard >= 3 or not v.is_alive or v.id in self.swarm or t - self.honked.get(v.id, -9) < HORN_COOLDOWN:
+                continue
+            d = v.get_location() - tr.location
+            along, lat = d.x * f.x + d.y * f.y, -d.x * f.y + d.y * f.x
+            if not (0 < along < HORN_REACH and abs(lat) < 3.0):
+                continue
+            self.honked[v.id] = t
+            heard += 1
+            r = riders.get(v.id)
+            if r is not None:
+                if not r.reckless:  # a darting bike does not care
+                    r.honked = r.t
+                continue
+            wp = self.map.get_waypoint(v.get_location())
+            speed = max(15.0, math.hypot(v.get_velocity().x, v.get_velocity().y) * 3.6 + 5)
+            Rider(env, wp, lambda r, speed=speed: (wp.lane_width / 2 - 0.5, speed), life=2.5, vehicle=v)
 
     def _swarm(self, env):
         '''At red lights nobody queues: vehicles approaching the stop line are packed into free cells of a grid
@@ -268,19 +307,27 @@ def _ahead_of_ego(env, actor):
 class Rider:
     '''Motorbike following a reference lane at plan(rider) -> (lateral offset m, speed km/h), then handed to the TM.'''
 
-    def __init__(self, env, wp, plan, life, vehicle=None):
-        '''vehicle=None spawns a new motorbike (dies with the episode); else takes over that vehicle from the TM.'''
+    def __init__(self, env, wp, plan, life, vehicle=None, spawn=False):
+        '''vehicle=None: takes over a free motorbike near the plan's start, or spawns one there if that spot is out of the
+        ego's view (spawn=True: always spawns, for staged benchmark scenes); else takes over that vehicle from the TM.'''
         self.env, self.wp, self.plan, self.life, self.t, self.v = env, wp, plan, life, 0.0, vehicle
         self.last_control = None
         self.merging = False
         self.reckless = False  # True: ignores the clearance check (a darting bike does not wait for a gap)
+        self.honked = -9.0  # rider time it last heard the ego's horn
+        self.signal, self.signal_on = None, False  # 'left' / 'right': blinker the rider shows before moving across
         if vehicle is None:
-            bp = env.world.get_blueprint_library().find(random.choice(MOTORBIKES))
-            tr = carla.Transform(_offset(wp, plan(self)[0]) + carla.Location(z=0.5), wp.transform.rotation)
-            self.v = env.world.try_spawn_actor(bp, tr)
-            if self.v:
-                env.actor_list.append(self.v)
-        else:
+            spot = _offset(wp, plan(self)[0])
+            vehicle = None if spawn else _adopt(env, spot, wp)  # a surprise is an existing road user doing something
+            if vehicle is None and (spawn or hidden(env, spot)):
+                bp = env.world.get_blueprint_library().find(random.choice(MOTORBIKES))
+                self.v = env.world.try_spawn_actor(bp, carla.Transform(spot + carla.Location(z=0.5), wp.transform.rotation))
+                if self.v:
+                    env.actor_list.append(self.v)
+            elif vehicle is not None:
+                self.wp = env.map.get_waypoint(vehicle.get_location())
+        if vehicle is not None:
+            self.v = vehicle
             vehicle.set_autopilot(False)
         if self.v:
             env.riders.append(self)  # stepped by the env every tick
@@ -303,6 +350,9 @@ class Rider:
         if self.v is None or not self.v.is_alive:
             return False
         if self.t > self.life:
+            if self.signal_on:
+                self.v.set_light_state(carla.VehicleLightState.NONE)
+                self.signal_on = False
             if not self.merging:  # 3 s back to the lane centre first: the TM strands vehicles it finds off the lane
                 self.merging, self.life, self.plan = True, self.life + 3.0, lambda r: (0.0, 18.0)
             else:
@@ -316,10 +366,26 @@ class Rider:
                 break
             self.wp = nxt[0]
         plan = self.plan(self)
-        if plan is None:  # plan is over (e.g. light turned green)
-            self.v.set_autopilot(True, TM_PORT)
-            return False
+        if plan is None:  # plan is over (e.g. light turned green): back to the lane centre first, like at the end of life;
+            # a swarm cell can be over the centre line, and the TM leaves vehicles it finds off the lane standing for good
+            self.merging, self.life, self.plan = True, self.t + 3.0, lambda r: (0.0, 18.0)
+            plan = self.plan(self)
         offset, speed = plan
+        if self.t - self.honked < 2.5:  # heard the ego's horn: keep right, get out of the way
+            offset, speed = max(offset, self.wp.lane_width / 2 - 0.5), max(speed, 15.0)
+        blink = getattr(self.env, 'blinker', 0)
+        if blink and not self.merging:  # the ego signals a turn: do not pass it on that side
+            d = loc - self.env.vehicle.get_location()
+            ef = self.env.vehicle.get_transform().get_forward_vector()
+            along, lat = d.x * ef.x + d.y * ef.y, -d.x * ef.y + d.y * ef.x
+            if -12 < along < 3 and lat * blink > 0:
+                speed = min(speed, self.env.velocity)
+        if self.signal and self.t < 2.0 and not self.signal_on:  # shown from the start, like a rider who bothers to signal
+            self.v.set_light_state(carla.VehicleLightState.LeftBlinker if self.signal == 'left' else carla.VehicleLightState.RightBlinker)
+            self.signal_on = True
+        elif self.signal_on and self.t >= 2.5:
+            self.v.set_light_state(carla.VehicleLightState.NONE)
+            self.signal_on = False
         if not self.reckless and self._blocked(loc, self.v.get_transform()):
             speed = 0.0  # never ride into someone: stacked bikes are what launches them into the air
         ahead = self.wp.next(5.0)
@@ -343,6 +409,30 @@ class Rider:
         return True
 
 
+def _adopt(env, spot, wp, radius=15.0):
+    '''A two-wheeler on autopilot near `spot` heading the same way as `wp`, free for an event to take over.'''
+    if not getattr(env, 'traffic', None):
+        return None
+    busy = {r.v.id for r in env.riders if r.v} | set(env.traffic.swarm)
+    f = wp.transform.get_forward_vector()
+    best = None
+    for v in env.traffic.motorbikes:
+        if v.id in busy or not v.is_alive:
+            continue
+        d = v.get_location().distance(spot)
+        vf = v.get_transform().get_forward_vector()
+        if d < radius and vf.x * f.x + vf.y * f.y > 0.7 and (best is None or d < best[0]):
+            best = (d, v)
+    return best[1] if best else None
+
+
+def _signal(r, side, p=0.5):
+    '''Vietnamese riders signal sometimes: with probability p the rider shows `side` before moving across.'''
+    if r and random.random() < p:
+        r.signal = side
+    return r
+
+
 def _ego_lane(env, metres):
     wp = env.map.get_waypoint(env.vehicle.get_location())
     nxt = wp.next(metres) if metres > 0 else wp.previous(-metres)
@@ -352,7 +442,7 @@ def _ego_lane(env, metres):
 def cutin(env):
     '''Rides the right edge just ahead, swerves into the ego path, then dawdles.'''
     wp = _ego_lane(env, 12)
-    return wp and Rider(env, wp, lambda r: (1.4 * max(0.0, 1 - max(0.0, r.t - 1.0)), 18 if r.t < 2 else 8), life=6)
+    return wp and _signal(Rider(env, wp, lambda r: (1.4 * max(0.0, 1 - max(0.0, r.t - 1.0)), 18 if r.t < 2 else 8), life=6), 'left')
 
 
 def encroach(env):
@@ -370,7 +460,7 @@ def overtake(env):
         a = _ahead_of_ego(env, r.v) if r.v else -10
         back = max(0.0, min(1.0, (a - 5) / 4))  # 0 until 5 m ahead, fully back in lane at 9 m
         return -3.2 * (1 - back), max(30.0, env.velocity + 15) if back < 1 else max(5.0, env.velocity - 3)
-    return wp and Rider(env, wp, plan, life=10)
+    return wp and _signal(Rider(env, wp, plan, life=10), 'left')
 
 
 def suddenstop(env):
@@ -380,17 +470,39 @@ def suddenstop(env):
 
 
 def jaywalk(env):
-    '''Pedestrian sprints across the road close ahead.'''
-    wp = _ego_lane(env, 14)
+    '''Pedestrian waiting on the kerb ahead sprints across the road when the ego is ~16 m away.'''
+    wp = _ego_lane(env, HIDDEN_FAR + 2)  # appears where it cannot pop up in view
     if not wp:
         return None
-    r = wp.transform.get_right_vector()
     w = env.world.try_spawn_actor(env.world.get_blueprint_library().filter('walker.pedestrian.*')[0],
                                   carla.Transform(_offset(wp, 4.5) + carla.Location(z=1.0)))
-    if w:
-        w.apply_control(carla.WalkerControl(direction=carla.Vector3D(-r.x, -r.y, 0), speed=3.5))
-        env.actor_list.append(w)
-    return w
+    if not w:
+        return None
+    env.actor_list.append(w)
+    r = Jaywalker(env, w, wp)
+    env.riders.append(r)
+    return r
+
+
+class Jaywalker:
+    '''Stepped like a Rider: stands still until the ego is close, then runs across its lane.'''
+
+    def __init__(self, env, walker, wp, trigger=16.0, life=25.0):
+        self.env, self.v, self.wp, self.trigger, self.life, self.t, self.go = env, walker, wp, trigger, life, 0.0, False
+        self.reckless, self.merging, self.honked = True, False, -9.0
+
+    def __bool__(self):
+        return self.v is not None
+
+    def step(self):
+        self.t += DT
+        if self.t > self.life or not self.v.is_alive:
+            return False
+        if not self.go and _ahead_of_ego(self.env, self.v) < self.trigger:
+            r = self.wp.transform.get_right_vector()
+            self.v.apply_control(carla.WalkerControl(direction=carla.Vector3D(-r.x, -r.y, 0), speed=3.5))
+            self.go = True
+        return True
 
 
 def swerve(env):
@@ -403,7 +515,7 @@ def swerve(env):
     def plan(r):
         k = max(0.0, min(1.0, (r.t - 1.0) / 1.2))  # 1 s alongside, then 1.2 s across the ego path
         return left + (kerb - left) * k, max(12.0, env.velocity + 4) if k < 1 else 5.0
-    return Rider(env, wp, plan, life=6)
+    return _signal(Rider(env, wp, plan, life=6), 'right')
 
 
 def wrongway(env):
@@ -419,7 +531,7 @@ def pullout(env):
     if not wp:
         return None
     kerb = wp.lane_width / 2 + 1.8
-    return Rider(env, wp, lambda r: (kerb * max(0.0, 1 - max(0.0, r.t - 0.3) / 0.8), 12.0), life=6)
+    return _signal(Rider(env, wp, lambda r: (kerb * max(0.0, 1 - max(0.0, r.t - 0.3) / 0.8), 12.0), life=6), 'left')
 
 
 def zigzag(env):
@@ -506,7 +618,7 @@ def occluded(env):
         k = min(1.0, (r.t - go['at']) / 1.3)
         return kerb + (far - kerb) * k, 18.0
     # life 60 s: if it ran out while the bike still waits, its merge-back would steer it into the ego lane (seen in v2i runs)
-    bike = Rider(env, ahead[0], plan, life=60)
+    bike = Rider(env, ahead[0], plan, life=60, spawn=True)
     if bike:
         bike.truck, bike.go, bike.reckless = truck, go, True
     return bike
@@ -514,3 +626,6 @@ def occluded(env):
 
 EVENTS = {'cutin': cutin, 'encroach': encroach, 'overtake': overtake, 'suddenstop': suddenstop, 'jaywalk': jaywalk,
           'swerve': swerve, 'wrongway': wrongway, 'pullout': pullout, 'zigzag': zigzag, 'flock': flock, 'surround': surround, 'occluded': occluded}
+# random surprises: not 'occluded', its bike waits at the lane edge until the ego is 11 m away, and traffic queued behind
+# it (then the ego behind them) never gets that close: a deadlock. It is a benchmark scenario (occlusion_eval.py, spawn).
+CHAOS = [k for k in EVENTS if k != 'occluded']

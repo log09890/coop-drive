@@ -41,6 +41,8 @@ class CarlaEnvironment():
         self.front_obstacle = np.inf
         self.last_blocked = 0.0
         self.d_steer = self.d_pedal = 0.0
+        self.blinker, self.horn, self.horns = 0, False, 0  # -1 left, 1 right; horn this step; honks this episode
+        self.vehicle_xy, self.vehicle_ids = np.zeros((0, 2)), np.zeros(0, int)
         self.red_moving = False
 
         # Two very important lists for keeping track of our actors and their observations.
@@ -140,6 +142,8 @@ class CarlaEnvironment():
             self.throttle = float(0.0)
             self.previous_steer = float(0.0)
             self.velocity = float(0.0)
+            self.red_wait = 0.0
+            self.blinker, self.horn, self.horns = 0, False, 0
             self.distance_from_center = float(0.0)
             self.angle = float(0.0)
             self.center_lane_deviation = 0.0
@@ -256,6 +260,10 @@ class CarlaEnvironment():
                     throttle = max(min(throttle, 1.0), 0.0)
                     brake = 0.0
                 self.vehicle.apply_control(carla.VehicleControl(steer=self.previous_steer*0.9 + steer*0.1, throttle=self.throttle*0.9 + throttle*0.1, brake=brake))
+                if COOP_SECTORS:
+                    self.horn = len(action_idx) > 2 and float(action_idx[2]) > 0.5  # third action: the horn (> 0.5 = sounding)
+                    self.horns += self.horn
+                    self._update_blinker()
                 self.previous_steer = steer
                 self.throttle = throttle
             else:
@@ -279,11 +287,18 @@ class CarlaEnvironment():
                 if self.traffic:
                     self.traffic.update(self)
             
-            # Traffic Light state
-            if self.vehicle.is_at_traffic_light() and not self.traffic:  # VN mode: real lights, the swarm waits at red
+            # Traffic Light state. VN mode: real lights (the swarm waits at red), but the ego waits at most VN_RED_WAIT s,
+            # then its light turns green and the rest of its junction red: long reds only slowed training down
+            red = self.vehicle.is_at_traffic_light() and self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red
+            self.red_wait = self.red_wait + 0.05 if red else 0.0
+            if red and (not self.traffic or self.red_wait > VN_RED_WAIT):
                 traffic_light = self.vehicle.get_traffic_light()
-                if traffic_light.get_state() == carla.TrafficLightState.Red:
-                    traffic_light.set_state(carla.TrafficLightState.Green)
+                if self.traffic:
+                    for other in traffic_light.get_group_traffic_lights():
+                        if other.id != traffic_light.id:
+                            other.set_state(carla.TrafficLightState.Red)
+                traffic_light.set_state(carla.TrafficLightState.Green)
+                self.red_wait = 0.0
 
             self.collision_history = self.collision_obj.collision_data            
 
@@ -361,6 +376,7 @@ class CarlaEnvironment():
                     red = self.traffic is not None and self.vehicle.is_at_traffic_light() and \
                         self.vehicle.get_traffic_light_state() == carla.TrafficLightState.Red and self.velocity > 5
                     self.red_moving = red
+                    reward -= 0.02 * self.horn  # honking costs a little: it must buy something (bikes moving aside)
                     reward -= safety_penalty(self.front_obstacle, self.last_sectors.min() * COOP_RANGE, self.velocity, red,
                                              self.d_steer, self.d_pedal)
 
@@ -603,11 +619,50 @@ class CarlaEnvironment():
     def coop_obs(self):
         if not COOP_SECTORS:
             return np.zeros(0)
-        return np.concatenate([self._coop_vec(self.share, primary=True), self.infra_obs()])
+        return np.concatenate([self._coop_vec(self.share, primary=True), self.signal_obs(), self.infra_obs()])
 
     # The same features for the other sharing mode (no side effects on the env), recorded for the ablation
     def coop_obs_other(self):
-        return np.concatenate([self._coop_vec(not self.share, primary=False), self.infra_obs()])
+        return np.concatenate([self._coop_vec(not self.share, primary=False), self.signal_obs(), self.infra_obs()])
+
+    def _update_blinker(self):
+        '''Turn signal from the route: the road 3 m ahead vs 25 m ahead turns by more than 30 deg -> blink that way.'''
+        i, wps = self.current_waypoint_index, self.route_waypoints
+        blink = 0
+        if i + 25 < len(wps):
+            turn = (wps[i + 25].transform.rotation.yaw - wps[i + 3].transform.rotation.yaw + 180) % 360 - 180
+            blink = 1 if turn > 30 else -1 if turn < -30 else 0  # UE4 yaw grows clockwise: positive = right
+        if blink != self.blinker:
+            self.blinker = blink
+            L = carla.VehicleLightState
+            self.vehicle.set_light_state(L.RightBlinker if blink > 0 else L.LeftBlinker if blink < 0 else L.NONE)
+
+    # Turn signals and horn as the ego perceives them (a camera reads blinkers of the vehicles ahead)
+    def signal_obs(self):
+        out = [float(self.blinker < 0), float(self.blinker > 0), float(self.horn)]
+        t = self.vehicle.get_transform()
+        f = t.get_forward_vector()
+        near = []
+        if len(self.vehicle_ids):
+            d = self.vehicle_xy - (t.location.x, t.location.y)
+            along, lat = d @ (f.x, f.y), d @ (-f.y, f.x)
+            for k in np.argsort(np.hypot(along, lat)):
+                if self.vehicle_ids[k] != self.vehicle.id and -5 < along[k] < 30 and abs(lat[k]) < 8:
+                    near.append(k)
+                    if len(near) == 4:
+                        break
+        lights = {}
+        for a in (self.world.get_actors([int(self.vehicle_ids[k]) for k in near]) if near else []):
+            try:
+                lights[a.id] = int(a.get_light_state())
+            except RuntimeError:  # bike recycled/destroyed since vehicle_ids was cached
+                pass
+        L = carla.VehicleLightState
+        for k in near:
+            ls = lights.get(int(self.vehicle_ids[k]), 0)
+            out += [along[k] / 30, lat[k] / 30, float(bool(ls & int(L.LeftBlinker))), float(bool(ls & int(L.RightBlinker)))]
+        out += [0.0] * 4 * (4 - len(near))
+        return np.array(out, np.float32)
 
     # What the ego knows through V2X (objects from RSUs / coop cars, the light ahead); zeros without infrastructure
     def infra_obs(self):
@@ -617,7 +672,7 @@ class CarlaEnvironment():
         sectors, front = self.coop_features(share)
         if primary:
             self.front_obstacle, self.last_sectors = front, sectors
-            if front < 10:
+            if front < 10 or (self.infra and self.infra.warning_now() is not None):  # waiting out a DENM is not idling
                 self.last_blocked = self.now()
         cur = np.append(sectors, min(front, COOP_CORRIDOR) / COOP_CORRIDOR)
         prev = self.prev_coop.get(share, cur)
